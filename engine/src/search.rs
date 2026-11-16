@@ -15,6 +15,7 @@
 
 mod ordering;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use self::ordering::{OrderedMoves, tactical_score};
@@ -31,6 +32,10 @@ pub const INFINITY: i32 = 32_001;
 /// The deepest the search goes, counting quiescence plies too.
 pub const MAX_PLY: usize = 128;
 const DRAW: i32 = 0;
+
+/// The clock and the stop flag are checked once per this many nodes: reading
+/// the clock costs more than searching a node.
+const CHECK_INTERVAL: u64 = 1024;
 
 /// The number of moves to a forced mate, if `score` announces one: positive
 /// when the side to move mates, negative when it gets mated.
@@ -53,6 +58,10 @@ pub struct Limits {
     pub depth: Option<u32>,
     /// Nodes to visit.
     pub nodes: Option<u64>,
+    /// No new iteration starts once this much time has passed.
+    pub soft_time: Option<Duration>,
+    /// The search stops once this much time has passed, even mid-iteration.
+    pub hard_time: Option<Duration>,
 }
 
 /// The result of one completed iteration, for progress output.
@@ -80,25 +89,33 @@ pub struct Outcome {
 ///
 /// `history` holds the keys of the earlier positions of the game since the
 /// last irreversible move, oldest first; repeating one of them is a draw.
-/// `report` is called after every completed iteration.
+/// Setting `stop` ends the search early. Time limits and `stop` only take
+/// effect once the first iteration is complete, so a searched move is
+/// always available. `report` is called after every completed iteration.
 pub fn search(
     root: &Position,
     history: &[u64],
     limits: Limits,
+    stop: &AtomicBool,
     mut report: impl FnMut(&Report),
 ) -> Outcome {
     let start = Instant::now();
     let mut searcher = Searcher {
         nodes: 0,
         node_limit: limits.nodes.unwrap_or(u64::MAX),
+        stop,
+        start,
+        hard_time: limits.hard_time,
+        interruptible: false,
         stopped: false,
         path: history.to_vec(),
         prev_pv: MoveList::new(),
     };
 
     // Until an iteration completes, any legal move will have to do.
+    let root_moves = legal_moves(root);
     let mut outcome = Outcome {
-        best_move: legal_moves(root).first().copied(),
+        best_move: root_moves.first().copied(),
         score: DRAW,
         depth: 0,
         nodes: 0,
@@ -135,15 +152,31 @@ pub fn search(
             pv: &pv,
         });
         searcher.prev_pv = pv.clone();
+        searcher.interruptible = true;
+
+        // Another iteration would likely take several times as long as this
+        // one, so none is started once the soft limit has passed. With a
+        // single legal move there is nothing to choose, under a clock.
+        let timed = limits.soft_time.is_some();
+        let soft_limit_passed = limits.soft_time.is_some_and(|soft| start.elapsed() >= soft);
+        if soft_limit_passed || (timed && root_moves.len() == 1) || stop.load(Ordering::Relaxed) {
+            break;
+        }
     }
     outcome.nodes = searcher.nodes;
     outcome
 }
 
 /// The state of one search.
-struct Searcher {
+struct Searcher<'a> {
     nodes: u64,
     node_limit: u64,
+    stop: &'a AtomicBool,
+    start: Instant,
+    hard_time: Option<Duration>,
+    /// Whether time and the stop flag may cut the search short: true once the
+    /// first iteration is complete.
+    interruptible: bool,
     /// Set once a limit is reached; every node then returns at once.
     stopped: bool,
     /// Keys of the positions before the current node: the game history, then
@@ -153,12 +186,19 @@ struct Searcher {
     prev_pv: MoveList,
 }
 
-impl Searcher {
+impl Searcher<'_> {
     /// Counts a node and tells whether the search must stop.
     fn visit(&mut self) -> bool {
         self.nodes += 1;
         if self.nodes >= self.node_limit {
             self.stopped = true;
+        } else if self.interruptible && self.nodes.is_multiple_of(CHECK_INTERVAL) {
+            let out_of_time = self
+                .hard_time
+                .is_some_and(|hard| self.start.elapsed() >= hard);
+            if out_of_time || self.stop.load(Ordering::Relaxed) {
+                self.stopped = true;
+            }
         }
         self.stopped
     }
@@ -320,12 +360,19 @@ mod tests {
     use super::*;
     use crate::types::{MoveKind, Square};
 
-    fn run(fen: &str, depth: u32) -> Outcome {
-        let limits = Limits {
+    fn depth(depth: u32) -> Limits {
+        Limits {
             depth: Some(depth),
-            nodes: None,
-        };
-        search(&Position::from_fen(fen).unwrap(), &[], limits, |_| {})
+            ..Limits::default()
+        }
+    }
+
+    fn search_quietly(pos: &Position, history: &[u64], limits: Limits) -> Outcome {
+        search(pos, history, limits, &AtomicBool::new(false), |_| {})
+    }
+
+    fn run(fen: &str, plies: u32) -> Outcome {
+        search_quietly(&Position::from_fen(fen).unwrap(), &[], depth(plies))
     }
 
     fn best_move(outcome: &Outcome) -> String {
@@ -410,11 +457,7 @@ mod tests {
             history.push(pos.key());
             pos = pos.make_move(Move::new(from, to, MoveKind::Normal));
         }
-        let limits = Limits {
-            depth: Some(3),
-            nodes: None,
-        };
-        let outcome = search(&pos, &history, limits, |_| {});
+        let outcome = search_quietly(&pos, &history, depth(3));
         assert_eq!(
             outcome.best_move,
             Some(Move::new(S::F6, S::G8, MoveKind::Normal))
@@ -426,23 +469,15 @@ mod tests {
     fn reports_every_iteration_with_a_legal_line() {
         let pos = Position::startpos();
         let mut depths = Vec::new();
-        let outcome = search(
-            &pos,
-            &[],
-            Limits {
-                depth: Some(4),
-                nodes: None,
-            },
-            |report| {
-                depths.push(report.depth);
-                // Every move of the line must be legal in turn.
-                let mut line_pos = pos;
-                for &mv in report.pv {
-                    assert!(legal_moves(&line_pos).contains(&mv));
-                    line_pos = line_pos.make_move(mv);
-                }
-            },
-        );
+        let outcome = search(&pos, &[], depth(4), &AtomicBool::new(false), |report| {
+            depths.push(report.depth);
+            // Every move of the line must be legal in turn.
+            let mut line_pos = pos;
+            for &mv in report.pv {
+                assert!(legal_moves(&line_pos).contains(&mv));
+                line_pos = line_pos.make_move(mv);
+            }
+        });
         assert_eq!(depths, [1, 2, 3, 4]);
         assert_eq!(outcome.depth, 4);
     }
@@ -450,12 +485,55 @@ mod tests {
     #[test]
     fn node_limit_stops_the_search() {
         let limits = Limits {
-            depth: None,
             nodes: Some(5_000),
+            ..Limits::default()
         };
-        let outcome = search(&Position::startpos(), &[], limits, |_| {});
+        let outcome = search_quietly(&Position::startpos(), &[], limits);
         assert!(outcome.best_move.is_some());
         assert!(outcome.nodes <= 5_000);
+    }
+
+    #[test]
+    fn stop_flag_ends_the_search_after_the_first_iteration() {
+        let stop = AtomicBool::new(true);
+        let outcome = search(&Position::startpos(), &[], Limits::default(), &stop, |_| {});
+        assert_eq!(outcome.depth, 1);
+        assert!(outcome.best_move.is_some());
+    }
+
+    #[test]
+    fn time_limits_end_the_search() {
+        let kiwipete = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .unwrap();
+        let limits = Limits {
+            soft_time: Some(Duration::from_millis(20)),
+            hard_time: Some(Duration::from_millis(50)),
+            ..Limits::default()
+        };
+        let start = Instant::now();
+        let outcome = search_quietly(&kiwipete, &[], limits);
+        assert!(outcome.depth >= 1 && outcome.best_move.is_some());
+        // Generous, so a slow debug build or a busy machine does not fail it.
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_single_legal_move_is_played_at_once_under_a_clock() {
+        // Double check from the bishop and the rook: Kg8 is the only escape.
+        let pos = Position::from_fen("7k/8/8/4B3/8/8/8/K6R b - - 0 1").unwrap();
+        assert_eq!(legal_moves(&pos).len(), 1);
+        let limits = Limits {
+            soft_time: Some(Duration::from_secs(60)),
+            hard_time: Some(Duration::from_secs(60)),
+            ..Limits::default()
+        };
+        assert_eq!(search_quietly(&pos, &[], limits).depth, 1);
     }
 
     #[test]

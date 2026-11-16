@@ -1,10 +1,18 @@
 //! The Universal Chess Interface (UCI): the text protocol through which a
 //! chess GUI drives the engine. Commands arrive on standard input, one per
 //! line; answers go to standard output.
+//!
+//! A search runs on its own thread, so the engine keeps reading commands
+//! while it thinks: `isready` is answered at once, and `stop` ends the search,
+//! which then prints its `bestmove`.
 
+use std::fmt::Display;
 use std::io::{self, BufRead, Write};
-
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use crate::board::Position;
 use crate::eval::evaluate;
@@ -14,10 +22,13 @@ use crate::types::{Color, Move, MoveKind};
 
 /// Largest accepted `Hash` value, in MiB.
 const HASH_MAX: u64 = 65_536;
-
-/// How deep a `go` without `depth` or `nodes` searches, until time
-/// management takes over this job.
-const DEFAULT_DEPTH: u32 = 6;
+/// Default and largest `Move Overhead`, in milliseconds: time kept in hand
+/// for the delay between the engine and the GUI's clock.
+const MOVE_OVERHEAD_DEFAULT: u64 = 10;
+const MOVE_OVERHEAD_MAX: u64 = 5_000;
+/// Moves assumed to remain until the next time control when the GUI does
+/// not say (`movestogo`).
+const DEFAULT_MOVES_TO_GO: u64 = 30;
 
 /// What the command loop does after a command.
 #[derive(Debug, PartialEq, Eq)]
@@ -26,8 +37,9 @@ enum Flow {
     Quit,
 }
 
-/// The engine's state between commands.
-struct Uci {
+/// The engine's state between commands. `W` is where the output goes:
+/// standard output, or a buffer in tests.
+struct Uci<W> {
     /// The position the next search starts from.
     position: Position,
     /// Keys of the earlier positions of the game since the last irreversible
@@ -36,31 +48,77 @@ struct Uci {
     history: Vec<u64>,
     /// Whether castling moves are written as "king takes rook" (`UCI_Chess960`).
     chess960: bool,
+    /// `Move Overhead`, in milliseconds.
+    move_overhead: u64,
+    /// Shared with the search thread, which prints its own lines.
+    out: Arc<Mutex<W>>,
+    /// The running or finished search that has not been waited for yet.
+    search: Option<SearchThread>,
+}
+
+/// A search running on its own thread.
+struct SearchThread {
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+    /// Whether the search has no limit and runs until `stop`.
+    unbounded: bool,
 }
 
 /// Reads commands from standard input until `quit` or the end of the input.
+///
+/// `quit` stops a running search at once. At the end of the input a search
+/// with a limit still finishes and prints its move, which makes piping
+/// commands into the engine by hand work; one without a limit is stopped.
 pub fn run() -> io::Result<()> {
-    let mut uci = Uci::new();
-    let mut out = io::stdout();
+    let mut uci = Uci::new(io::stdout());
     for line in io::stdin().lock().lines() {
-        if uci.handle(&line?, &mut out)? == Flow::Quit {
-            break;
+        match line.and_then(|line| uci.handle(&line)) {
+            Ok(Flow::Continue) => {}
+            Ok(Flow::Quit) => {
+                uci.stop_search();
+                return Ok(());
+            }
+            Err(err) => {
+                uci.stop_search();
+                return Err(err);
+            }
         }
+    }
+    if uci.search.as_ref().is_some_and(|search| search.unbounded) {
+        uci.stop_search();
+    } else {
+        uci.wait_for_search();
     }
     Ok(())
 }
 
-impl Uci {
-    fn new() -> Uci {
+/// Writes one line and flushes it, so the GUI sees it at once.
+fn write_line<W: Write>(out: &Mutex<W>, line: impl Display) -> io::Result<()> {
+    // A thread that panicked while printing leaves the lock poisoned; the
+    // output itself is still usable.
+    let mut out = out.lock().unwrap_or_else(PoisonError::into_inner);
+    writeln!(out, "{line}")?;
+    out.flush()
+}
+
+impl<W: Write + Send + 'static> Uci<W> {
+    fn new(out: W) -> Uci<W> {
         Uci {
             position: Position::startpos(),
             history: Vec::new(),
             chess960: false,
+            move_overhead: MOVE_OVERHEAD_DEFAULT,
+            out: Arc::new(Mutex::new(out)),
+            search: None,
         }
     }
 
-    /// Carries out one command line, writing any answer to `out`.
-    fn handle(&mut self, line: &str, out: &mut impl Write) -> io::Result<Flow> {
+    fn say(&self, line: impl Display) -> io::Result<()> {
+        write_line(&self.out, line)
+    }
+
+    /// Carries out one command line.
+    fn handle(&mut self, line: &str) -> io::Result<Flow> {
         let line = line.trim();
         let (command, args) = match line.split_once(char::is_whitespace) {
             Some((command, args)) => (command, args.trim()),
@@ -68,23 +126,27 @@ impl Uci {
         };
         match command {
             "" => {}
-            "uci" => self.identify(out)?,
-            "isready" => writeln!(out, "readyok")?,
+            "uci" => self.identify()?,
+            "isready" => self.say("readyok")?,
             "ucinewgame" => {
+                self.stop_search();
                 self.position = Position::startpos();
                 self.history.clear();
             }
             "position" => {
+                self.stop_search();
                 if let Err(err) = self.set_position(args) {
-                    writeln!(out, "info string {err}")?;
+                    self.say(format_args!("info string {err}"))?;
                 }
             }
             "setoption" => {
+                self.stop_search();
                 if let Err(err) = self.set_option(args) {
-                    writeln!(out, "info string {err}")?;
+                    self.say(format_args!("info string {err}"))?;
                 }
             }
-            "go" => self.go(args, out)?,
+            "go" => self.go(args)?,
+            "stop" => self.stop_search(),
             // Not part of UCI: shows the current position, for debugging by hand.
             "d" => {
                 let score = evaluate(&self.position);
@@ -92,31 +154,100 @@ impl Uci {
                     Color::White => score,
                     Color::Black => -score,
                 };
-                writeln!(
-                    out,
+                self.say(format_args!(
                     "{}\nKey: {:016x}\nEval: {white_view:+} cp (white's point of view)",
                     self.position,
                     self.position.key()
-                )?;
+                ))?;
             }
             "quit" => return Ok(Flow::Quit),
-            _ => writeln!(out, "info string unknown command '{command}'")?,
+            _ => self.say(format_args!("info string unknown command '{command}'"))?,
         }
-        out.flush()?;
         Ok(Flow::Continue)
     }
 
     /// Answers `uci`: the engine's name, its options and `uciok`.
-    fn identify(&self, out: &mut impl Write) -> io::Result<()> {
-        writeln!(out, "id name {} {}", crate::NAME, crate::VERSION)?;
-        writeln!(out, "id author {}", crate::AUTHOR)?;
-        writeln!(
-            out,
+    fn identify(&self) -> io::Result<()> {
+        self.say(format_args!("id name {} {}", crate::NAME, crate::VERSION))?;
+        self.say(format_args!("id author {}", crate::AUTHOR))?;
+        self.say(format_args!(
             "option name Hash type spin default 16 min 1 max {HASH_MAX}"
-        )?;
-        writeln!(out, "option name Threads type spin default 1 min 1 max 1")?;
-        writeln!(out, "option name UCI_Chess960 type check default false")?;
-        writeln!(out, "uciok")
+        ))?;
+        self.say("option name Threads type spin default 1 min 1 max 1")?;
+        self.say(format_args!(
+            "option name Move Overhead type spin default {MOVE_OVERHEAD_DEFAULT} min 0 max {MOVE_OVERHEAD_MAX}"
+        ))?;
+        self.say("option name UCI_Chess960 type check default false")?;
+        self.say("uciok")
+    }
+
+    /// `go`: starts a search of the current position on its own thread. The
+    /// search prints an `info` line per completed iteration, then `bestmove`.
+    fn go(&mut self, args: &str) -> io::Result<()> {
+        self.stop_search();
+        let command = match GoCommand::parse(args) {
+            Ok(command) => command,
+            Err(err) => return self.say(format_args!("info string {err}")),
+        };
+        let limits = command.limits(self.position.side_to_move(), self.move_overhead);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let out = Arc::clone(&self.out);
+        let position = self.position;
+        let history = self.history.clone();
+        let chess960 = self.chess960;
+        let infinite = command.infinite;
+        let unbounded = infinite
+            || (limits.depth.is_none() && limits.nodes.is_none() && limits.hard_time.is_none());
+        let handle = thread::spawn(move || {
+            // If the output is gone, so is the GUI: there is no one left to
+            // tell, so write errors are ignored here.
+            let outcome = search(&position, &history, limits, &thread_stop, |report| {
+                let _ = write_line(&out, info_line(report, chess960));
+            });
+            // After `go infinite` the GUI expects `bestmove` only once it has
+            // sent `stop`, even if the search ends by itself.
+            if infinite {
+                while !thread_stop.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            // "0000" is the UCI null move, for a position without legal moves.
+            let best = outcome
+                .best_move
+                .map_or_else(|| "0000".to_string(), |mv| mv.to_uci(chess960));
+            let _ = write_line(&out, format_args!("bestmove {best}"));
+        });
+        self.search = Some(SearchThread {
+            stop,
+            handle,
+            unbounded,
+        });
+        Ok(())
+    }
+
+    /// Stops the search, if one is running, and waits until it has printed
+    /// its `bestmove`.
+    fn stop_search(&mut self) {
+        if let Some(search) = self.search.take() {
+            search.stop.store(true, Ordering::Relaxed);
+            Self::join(search.handle);
+        }
+    }
+
+    /// Waits for a search to end by itself.
+    fn wait_for_search(&mut self) {
+        if let Some(search) = self.search.take() {
+            Self::join(search.handle);
+        }
+    }
+
+    fn join(handle: JoinHandle<()>) {
+        // A panic in the search is a bug: pass it on rather than hide it.
+        if let Err(panic) = handle.join() {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     /// `position [startpos | fen <fen>] [moves <move>...]`.
@@ -157,35 +288,6 @@ impl Uci {
         result
     }
 
-    /// `go [depth <n>] [nodes <n>]`: searches the current position, printing an
-    /// `info` line per completed iteration and then `bestmove`.
-    fn go(&mut self, args: &str, out: &mut impl Write) -> io::Result<()> {
-        let limits = match parse_go(args) {
-            Ok(limits) => limits,
-            Err(err) => {
-                // A GUI waits for `bestmove` after `go`, so search anyway.
-                writeln!(out, "info string {err}")?;
-                Limits {
-                    depth: Some(DEFAULT_DEPTH),
-                    nodes: None,
-                }
-            }
-        };
-        let chess960 = self.chess960;
-        let mut written = Ok(());
-        let outcome = search(&self.position, &self.history, limits, |report| {
-            if written.is_ok() {
-                written = writeln!(out, "{}", info_line(report, chess960));
-            }
-        });
-        written?;
-        // "0000" is the UCI null move, for a position without legal moves.
-        let best = outcome
-            .best_move
-            .map_or_else(|| "0000".to_string(), |mv| mv.to_uci(chess960));
-        writeln!(out, "bestmove {best}")
-    }
-
     /// `setoption name <name> [value <value>]`. Option names may contain spaces.
     fn set_option(&mut self, args: &str) -> Result<(), String> {
         let mut tokens = args.split_whitespace();
@@ -207,10 +309,82 @@ impl Uci {
             "threads" => {
                 parse_spin(&value, 1, 1)?;
             }
+            "move overhead" => self.move_overhead = parse_spin(&value, 0, MOVE_OVERHEAD_MAX)?,
             "uci_chess960" => self.chess960 = parse_check(&value)?,
             _ => return Err(format!("unknown option '{name}'")),
         }
         Ok(())
+    }
+}
+
+/// The parameters of a `go` command.
+#[derive(Debug, Default)]
+struct GoCommand {
+    depth: Option<u32>,
+    nodes: Option<u64>,
+    /// Exact time for this move, in milliseconds.
+    movetime: Option<u64>,
+    /// Time left on each clock (white, black), in milliseconds.
+    time: [Option<u64>; 2],
+    /// Increment per move for each side, in milliseconds.
+    increment: [Option<u64>; 2],
+    movestogo: Option<u64>,
+    infinite: bool,
+}
+
+impl GoCommand {
+    /// Reads the parameters; unknown ones (such as `ponder`) are skipped.
+    fn parse(args: &str) -> Result<GoCommand, String> {
+        let mut go = GoCommand::default();
+        let mut tokens = args.split_whitespace();
+        while let Some(token) = tokens.next() {
+            match token {
+                "depth" => go.depth = Some(parse_number(tokens.next(), token)?),
+                "nodes" => go.nodes = Some(parse_number(tokens.next(), token)?),
+                "movetime" => go.movetime = Some(parse_number(tokens.next(), token)?),
+                "wtime" => go.time[0] = Some(parse_number(tokens.next(), token)?),
+                "btime" => go.time[1] = Some(parse_number(tokens.next(), token)?),
+                "winc" => go.increment[0] = Some(parse_number(tokens.next(), token)?),
+                "binc" => go.increment[1] = Some(parse_number(tokens.next(), token)?),
+                "movestogo" => go.movestogo = Some(parse_number(tokens.next(), token)?),
+                "infinite" => go.infinite = true,
+                _ => {}
+            }
+        }
+        Ok(go)
+    }
+
+    /// The search limits for side `us`, keeping `overhead` milliseconds in
+    /// hand. Without any limit (a bare `go`) the search runs until `stop`.
+    fn limits(&self, us: Color, overhead: u64) -> Limits {
+        let mut limits = Limits {
+            depth: self.depth,
+            nodes: self.nodes,
+            ..Limits::default()
+        };
+        if self.infinite {
+            return limits;
+        }
+        let millis = Duration::from_millis;
+        if let Some(movetime) = self.movetime {
+            let time = millis(movetime.saturating_sub(overhead).max(1));
+            limits.soft_time = Some(time);
+            limits.hard_time = Some(time);
+        } else if let Some(left) = self.time[us.index()] {
+            // Spread the clock over the moves still to play, and spend most
+            // of each increment as it comes in.
+            let available = left.saturating_sub(overhead).max(1);
+            let increment = self.increment[us.index()].unwrap_or(0);
+            let moves_to_go = self.movestogo.unwrap_or(DEFAULT_MOVES_TO_GO).max(1);
+            let target = available / moves_to_go + increment * 3 / 4;
+            // A hard stop at three times the target, but never past half of
+            // the clock; no new iteration after half the target.
+            let hard = (target * 3).min(available / 2).max(1);
+            let soft = (target / 2).min(hard);
+            limits.soft_time = Some(millis(soft));
+            limits.hard_time = Some(millis(hard));
+        }
+        limits
     }
 }
 
@@ -232,23 +406,6 @@ fn parse_move(pos: &Position, text: &str, chess960: bool) -> Option<Move> {
                 .find(|mv| mv.kind() == MoveKind::Castle && written_as(mv, !chess960))
         })
         .copied()
-}
-
-/// Reads the limits of a `go` command. Time controls are ignored for now.
-fn parse_go(args: &str) -> Result<Limits, String> {
-    let mut limits = Limits::default();
-    let mut tokens = args.split_whitespace();
-    while let Some(token) = tokens.next() {
-        match token {
-            "depth" => limits.depth = Some(parse_number(tokens.next(), "depth")?),
-            "nodes" => limits.nodes = Some(parse_number(tokens.next(), "nodes")?),
-            _ => {}
-        }
-    }
-    if limits.depth.is_none() && limits.nodes.is_none() {
-        limits.depth = Some(DEFAULT_DEPTH);
-    }
-    Ok(limits)
 }
 
 /// Parses the number that follows a `go` parameter.
@@ -298,24 +455,34 @@ fn parse_check(value: &str) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
-    /// Feeds the command lines to a fresh engine and returns it with its output.
-    fn session(commands: &str) -> (Uci, String) {
-        let mut uci = Uci::new();
-        let mut out = Vec::new();
+    /// Everything the engine has printed so far.
+    fn output(uci: &Uci<Vec<u8>>) -> String {
+        String::from_utf8(uci.out.lock().unwrap().clone()).unwrap()
+    }
+
+    /// Feeds the command lines to a fresh engine, lets a search started by
+    /// them finish, and returns the engine with its output.
+    fn session(commands: &str) -> (Uci<Vec<u8>>, String) {
+        let mut uci = Uci::new(Vec::new());
         for line in commands.lines() {
-            if uci.handle(line, &mut out).unwrap() == Flow::Quit {
+            if uci.handle(line).unwrap() == Flow::Quit {
                 break;
             }
         }
-        (uci, String::from_utf8(out).unwrap())
+        uci.wait_for_search();
+        let out = output(&uci);
+        (uci, out)
     }
 
     #[test]
     fn handshake() {
         let (_, out) = session("uci\nisready");
         assert!(out.starts_with("id name Fishrod "));
+        assert!(out.contains("\noption name Move Overhead type spin default 10 min 0 max 5000\n"));
         assert!(out.contains("\noption name UCI_Chess960 type check default false\n"));
         assert!(out.ends_with("uciok\nreadyok\n"));
     }
@@ -351,7 +518,7 @@ mod tests {
         let fen = "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1";
         for chess960 in [false, true] {
             for mv in ["e1g1", "e1h1"] {
-                let mut uci = Uci::new();
+                let mut uci = Uci::new(Vec::new());
                 uci.chess960 = chess960;
                 uci.set_position(&format!("fen {fen} moves {mv}")).unwrap();
                 assert_eq!(uci.position.to_fen(), "r3k2r/8/8/8/8/8/8/R4RK1 b kq - 1 1");
@@ -389,14 +556,15 @@ mod tests {
 
         // An invalid FEN leaves the position alone.
         let (uci, out) = session("position startpos moves e2e4\nposition fen nonsense");
-        assert_eq!(uci.position.side_to_move(), crate::types::Color::Black);
+        assert_eq!(uci.position.side_to_move(), Color::Black);
         assert!(out.starts_with("info string invalid FEN"));
 
-        let (_, out) = session("position\nfoo bar");
+        let (_, out) = session("position\nfoo bar\ngo depth x");
         assert_eq!(
             out,
             "info string expected 'position startpos' or 'position fen <fen>'\n\
-             info string unknown command 'foo'\n"
+             info string unknown command 'foo'\n\
+             info string 'depth' needs a whole number\n"
         );
     }
 
@@ -405,9 +573,11 @@ mod tests {
         let (uci, out) = session(
             "setoption name UCI_Chess960 value true\n\
              setoption name Hash value 64\n\
-             setoption name Threads value 1",
+             setoption name Threads value 1\n\
+             setoption name Move Overhead value 50",
         );
         assert!(uci.chess960);
+        assert_eq!(uci.move_overhead, 50);
         assert_eq!(out, "");
 
         let (_, out) = session(
@@ -443,12 +613,72 @@ mod tests {
     }
 
     #[test]
-    fn go_limits() {
-        assert_eq!(parse_go("depth 4").unwrap().depth, Some(4));
-        let limits = parse_go("wtime 1000 btime 1000 nodes 500").unwrap();
-        assert_eq!((limits.depth, limits.nodes), (None, Some(500)));
-        assert_eq!(parse_go("").unwrap().depth, Some(DEFAULT_DEPTH));
-        assert!(parse_go("depth x").is_err());
+    fn infinite_search_waits_for_stop_and_still_answers_isready() {
+        let mut uci = Uci::new(Vec::new());
+        uci.handle("position startpos").unwrap();
+        uci.handle("go infinite").unwrap();
+        uci.handle("isready").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert!(output(&uci).contains("readyok\n"));
+        assert!(!output(&uci).contains("bestmove"));
+
+        uci.handle("stop").unwrap();
+        let out = output(&uci);
+        assert!(
+            out.lines().last().unwrap().starts_with("bestmove "),
+            "{out}"
+        );
+        assert_eq!(out.matches("bestmove").count(), 1);
+    }
+
+    #[test]
+    fn a_clock_ends_the_search_by_itself() {
+        let start = Instant::now();
+        let (_, out) = session("position startpos\ngo wtime 500 btime 500 winc 10 binc 10");
+        assert!(
+            out.lines().last().unwrap().starts_with("bestmove "),
+            "{out}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_new_command_stops_the_running_search() {
+        let mut uci = Uci::new(Vec::new());
+        uci.handle("go infinite").unwrap();
+        uci.handle("position startpos moves e2e4").unwrap();
+        assert!(output(&uci).contains("bestmove "));
+        assert!(uci.search.is_none());
+    }
+
+    #[test]
+    fn time_management() {
+        let go = |args: &str| GoCommand::parse(args).unwrap();
+        let ms = |millis: u64| Some(Duration::from_millis(millis));
+
+        // White: (60000 - 10) / 30 + 1000 * 3/4 = 1999 + 750 = 2749 ms target.
+        let limits = go("wtime 60000 btime 30000 winc 1000 binc 0").limits(Color::White, 10);
+        assert_eq!((limits.soft_time, limits.hard_time), (ms(1374), ms(8247)));
+        // Black: (30000 - 10) / 30 = 999 ms target.
+        let limits = go("wtime 60000 btime 30000 winc 1000 binc 0").limits(Color::Black, 10);
+        assert_eq!((limits.soft_time, limits.hard_time), (ms(499), ms(2997)));
+        // The last move before the time control: never more than half of what is left.
+        let limits = go("wtime 100 btime 100 movestogo 1").limits(Color::White, 10);
+        assert_eq!(limits.hard_time, ms(45));
+
+        let limits = go("movetime 500").limits(Color::White, 10);
+        assert_eq!((limits.soft_time, limits.hard_time), (ms(490), ms(490)));
+        let limits = go("infinite wtime 1000").limits(Color::White, 10);
+        assert_eq!((limits.soft_time, limits.hard_time), (None, None));
+        let limits = go("depth 7 nodes 1000").limits(Color::White, 10);
+        assert_eq!(
+            (limits.depth, limits.nodes, limits.hard_time),
+            (Some(7), Some(1000), None)
+        );
     }
 
     #[test]
