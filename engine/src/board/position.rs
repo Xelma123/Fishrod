@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use super::zobrist::piece_key;
 use crate::movegen::attacks::{
     bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks,
 };
@@ -74,6 +75,9 @@ pub struct Position {
     pub(super) en_passant: Option<Square>,
     pub(super) halfmove_clock: u16,
     pub(super) fullmove_number: u16,
+    /// Zobrist key of everything above except the move counters (see the
+    /// `zobrist` module). Placing and removing pieces keep it up to date.
+    pub(super) key: u64,
 }
 
 impl Position {
@@ -91,6 +95,7 @@ impl Position {
             en_passant: None,
             halfmove_clock: 0,
             fullmove_number: 1,
+            key: 0,
         }
     }
 
@@ -196,6 +201,7 @@ impl Position {
         self.board[sq.index()] = Some(piece);
         self.by_type[piece.piece_type().index()] |= bit;
         self.by_color[piece.color().index()] |= bit;
+        self.key ^= piece_key(piece, sq);
     }
 
     /// Takes the piece off `sq`, which must hold one, and returns it.
@@ -206,6 +212,7 @@ impl Position {
         let bit = Bitboard::from_square(sq);
         self.by_type[piece.piece_type().index()] ^= bit;
         self.by_color[piece.color().index()] ^= bit;
+        self.key ^= piece_key(piece, sq);
         piece
     }
 

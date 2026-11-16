@@ -72,6 +72,7 @@ impl Position {
         pos.en_passant = parse_en_passant(&pos, fields[3])?;
         pos.halfmove_clock = parse_counter(fields.get(4).copied(), 0)?;
         pos.fullmove_number = parse_counter(fields.get(5).copied(), 1)?;
+        pos.key = pos.compute_key();
         Ok(pos)
     }
 

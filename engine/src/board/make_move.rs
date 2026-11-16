@@ -1,6 +1,7 @@
 //! Playing a move: copy-make.
 
 use super::position::{CastlingSide, Position, castling_index};
+use super::zobrist::{black_to_move_key, castling_key, en_passant_key};
 use crate::types::{Color, Move, MoveKind, Piece, PieceType, Square};
 
 impl Position {
@@ -12,6 +13,12 @@ impl Position {
         let us = self.side_to_move;
         let (from, to) = (mv.from(), mv.to());
 
+        // The key follows the position: placing and removing pieces update it
+        // by themselves, the side to move, castling and en passant parts here.
+        pos.key ^= black_to_move_key();
+        if let Some(sq) = self.en_passant {
+            pos.key ^= en_passant_key(sq);
+        }
         pos.en_passant = None;
         pos.halfmove_clock = pos.halfmove_clock.saturating_add(1);
         if us == Color::Black {
@@ -74,6 +81,9 @@ impl Position {
                 *rook = None;
             }
         }
+        if pos.castling_rooks != self.castling_rooks {
+            pos.key ^= castling_key(&self.castling_rooks) ^ castling_key(&pos.castling_rooks);
+        }
 
         pos.side_to_move = !us;
         // Keep the en passant square only if the opponent can actually capture there.
@@ -81,6 +91,7 @@ impl Position {
             && pos.can_capture_en_passant(sq)
         {
             pos.en_passant = Some(sq);
+            pos.key ^= en_passant_key(sq);
         }
         pos
     }
