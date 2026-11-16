@@ -5,6 +5,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod bench;
 pub mod board;
 pub mod eval;
 pub mod movegen;

@@ -393,7 +393,7 @@ impl GoCommand {
 /// Castling is accepted in both notations, as the king's own move (`e1g1`) or
 /// as the king taking its rook (`e1h1`); the one `chess960` selects is tried
 /// first.
-fn parse_move(pos: &Position, text: &str, chess960: bool) -> Option<Move> {
+pub(crate) fn parse_move(pos: &Position, text: &str, chess960: bool) -> Option<Move> {
     let text = text.to_ascii_lowercase();
     let moves = legal_moves(pos);
     let written_as = |mv: &&Move, chess960: bool| mv.to_uci(chess960) == text;
