@@ -4,13 +4,20 @@
 
 use std::io::{self, BufRead, Write};
 
+use std::str::FromStr;
+
 use crate::board::Position;
 use crate::eval::evaluate;
 use crate::movegen::legal_moves;
+use crate::search::{Limits, Report, mate_in, search};
 use crate::types::{Color, Move, MoveKind};
 
 /// Largest accepted `Hash` value, in MiB.
 const HASH_MAX: u64 = 65_536;
+
+/// How deep a `go` without `depth` or `nodes` searches, until time
+/// management takes over this job.
+const DEFAULT_DEPTH: u32 = 6;
 
 /// What the command loop does after a command.
 #[derive(Debug, PartialEq, Eq)]
@@ -77,6 +84,7 @@ impl Uci {
                     writeln!(out, "info string {err}")?;
                 }
             }
+            "go" => self.go(args, out)?,
             // Not part of UCI: shows the current position, for debugging by hand.
             "d" => {
                 let score = evaluate(&self.position);
@@ -149,6 +157,35 @@ impl Uci {
         result
     }
 
+    /// `go [depth <n>] [nodes <n>]`: searches the current position, printing an
+    /// `info` line per completed iteration and then `bestmove`.
+    fn go(&mut self, args: &str, out: &mut impl Write) -> io::Result<()> {
+        let limits = match parse_go(args) {
+            Ok(limits) => limits,
+            Err(err) => {
+                // A GUI waits for `bestmove` after `go`, so search anyway.
+                writeln!(out, "info string {err}")?;
+                Limits {
+                    depth: Some(DEFAULT_DEPTH),
+                    nodes: None,
+                }
+            }
+        };
+        let chess960 = self.chess960;
+        let mut written = Ok(());
+        let outcome = search(&self.position, &self.history, limits, |report| {
+            if written.is_ok() {
+                written = writeln!(out, "{}", info_line(report, chess960));
+            }
+        });
+        written?;
+        // "0000" is the UCI null move, for a position without legal moves.
+        let best = outcome
+            .best_move
+            .map_or_else(|| "0000".to_string(), |mv| mv.to_uci(chess960));
+        writeln!(out, "bestmove {best}")
+    }
+
     /// `setoption name <name> [value <value>]`. Option names may contain spaces.
     fn set_option(&mut self, args: &str) -> Result<(), String> {
         let mut tokens = args.split_whitespace();
@@ -195,6 +232,47 @@ fn parse_move(pos: &Position, text: &str, chess960: bool) -> Option<Move> {
                 .find(|mv| mv.kind() == MoveKind::Castle && written_as(mv, !chess960))
         })
         .copied()
+}
+
+/// Reads the limits of a `go` command. Time controls are ignored for now.
+fn parse_go(args: &str) -> Result<Limits, String> {
+    let mut limits = Limits::default();
+    let mut tokens = args.split_whitespace();
+    while let Some(token) = tokens.next() {
+        match token {
+            "depth" => limits.depth = Some(parse_number(tokens.next(), "depth")?),
+            "nodes" => limits.nodes = Some(parse_number(tokens.next(), "nodes")?),
+            _ => {}
+        }
+    }
+    if limits.depth.is_none() && limits.nodes.is_none() {
+        limits.depth = Some(DEFAULT_DEPTH);
+    }
+    Ok(limits)
+}
+
+/// Parses the number that follows a `go` parameter.
+fn parse_number<T: FromStr>(token: Option<&str>, name: &str) -> Result<T, String> {
+    token
+        .and_then(|text| text.parse().ok())
+        .ok_or_else(|| format!("'{name}' needs a whole number"))
+}
+
+/// The `info` line for a completed iteration.
+fn info_line(report: &Report, chess960: bool) -> String {
+    let millis = report.time.as_millis();
+    let nps = u128::from(report.nodes) * 1000 / millis.max(1);
+    let score = match mate_in(report.score) {
+        Some(moves) => format!("mate {moves}"),
+        None => format!("cp {}", report.score),
+    };
+    let pv: Vec<String> = report.pv.iter().map(|mv| mv.to_uci(chess960)).collect();
+    format!(
+        "info depth {} score {score} nodes {} nps {nps} time {millis} pv {}",
+        report.depth,
+        report.nodes,
+        pv.join(" ")
+    )
 }
 
 /// Parses the value of a `spin` option, which must lie in `min..=max`.
@@ -345,6 +423,32 @@ mod tests {
              info string unknown option 'Ponder'\n\
              info string 'maybe' is not true or false\n"
         );
+    }
+
+    #[test]
+    fn go_prints_info_and_bestmove() {
+        let (_, out) = session("position startpos\ngo depth 3");
+        assert!(out.starts_with("info depth 1 score cp "), "{out}");
+        assert!(out.contains("\ninfo depth 3 score cp "), "{out}");
+        let last = out.lines().last().unwrap();
+        assert!(last.starts_with("bestmove ") && last.len() == "bestmove e2e4".len());
+
+        let (_, out) = session("position fen 6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1\ngo depth 3");
+        assert!(out.contains(" score mate 1 "), "{out}");
+        assert!(out.ends_with("bestmove a1a8\n"), "{out}");
+
+        // No legal move: the null move.
+        let (_, out) = session("position fen 7k/5Q2/6K1/8/8/8/8/8 b - - 0 1\ngo depth 2");
+        assert_eq!(out, "bestmove 0000\n");
+    }
+
+    #[test]
+    fn go_limits() {
+        assert_eq!(parse_go("depth 4").unwrap().depth, Some(4));
+        let limits = parse_go("wtime 1000 btime 1000 nodes 500").unwrap();
+        assert_eq!((limits.depth, limits.nodes), (None, Some(500)));
+        assert_eq!(parse_go("").unwrap().depth, Some(DEFAULT_DEPTH));
+        assert!(parse_go("depth x").is_err());
     }
 
     #[test]

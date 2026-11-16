@@ -33,6 +33,9 @@ pub enum FenError {
     InvalidEnPassant(String),
     /// A move counter is not a number.
     InvalidCounter(String),
+    /// The side that is not to move is in check, so its king could be taken.
+    /// No game can reach such a position.
+    OpponentInCheck,
 }
 
 impl fmt::Display for FenError {
@@ -48,6 +51,7 @@ impl fmt::Display for FenError {
             FenError::InvalidCastling(s) => write!(f, "invalid castling rights '{s}'"),
             FenError::InvalidEnPassant(s) => write!(f, "invalid en passant square '{s}'"),
             FenError::InvalidCounter(s) => write!(f, "invalid move counter '{s}'"),
+            FenError::OpponentInCheck => write!(f, "the side not to move is in check"),
         }
     }
 }
@@ -72,6 +76,13 @@ impl Position {
         pos.en_passant = parse_en_passant(&pos, fields[3])?;
         pos.halfmove_clock = parse_counter(fields.get(4).copied(), 0)?;
         pos.fullmove_number = parse_counter(fields.get(5).copied(), 1)?;
+
+        let us = pos.side_to_move;
+        if !(pos.attackers_to(pos.king_square(!us), pos.occupied()) & pos.occupied_by(us))
+            .is_empty()
+        {
+            return Err(FenError::OpponentInCheck);
+        }
         pos.key = pos.compute_key();
         Ok(pos)
     }
@@ -439,5 +450,16 @@ mod tests {
             error("4k3/8/8/8/8/8/8/4K3 w - - x 1"),
             FenError::InvalidCounter("x".to_string())
         );
+    }
+
+    #[test]
+    fn a_king_left_in_check_is_rejected() {
+        // White to move, yet the queen on a1 already checks the king on h8.
+        assert_eq!(
+            error("7k/8/6K1/8/8/8/8/Q7 w - - 0 1"),
+            FenError::OpponentInCheck
+        );
+        // The side to move may of course be in check.
+        assert!(Position::from_fen("7k/8/6K1/8/8/8/8/Q7 b - - 0 1").is_ok());
     }
 }

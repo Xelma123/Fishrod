@@ -1,7 +1,7 @@
 //! Moves and move lists.
 
 use std::fmt;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 
 use super::{PieceType, Square};
 
@@ -123,6 +123,9 @@ pub struct MoveList {
 }
 
 impl MoveList {
+    /// The most moves a list can hold.
+    pub const CAPACITY: usize = MAX_MOVES;
+
     /// An empty list.
     pub const fn new() -> MoveList {
         MoveList {
@@ -135,6 +138,11 @@ impl MoveList {
     pub fn push(&mut self, mv: Move) {
         self.moves[self.len] = mv;
         self.len += 1;
+    }
+
+    /// Removes every move.
+    pub fn clear(&mut self) {
+        self.len = 0;
     }
 }
 
@@ -150,6 +158,13 @@ impl Deref for MoveList {
     /// The filled part of the array, as a slice.
     fn deref(&self) -> &[Move] {
         &self.moves[..self.len]
+    }
+}
+
+impl DerefMut for MoveList {
+    /// The filled part of the array, as a slice that can be reordered.
+    fn deref_mut(&mut self) -> &mut [Move] {
+        &mut self.moves[..self.len]
     }
 }
 

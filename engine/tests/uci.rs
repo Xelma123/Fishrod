@@ -25,11 +25,16 @@ fn run(input: &str) -> String {
 
 #[test]
 fn session_over_standard_input() {
-    let out = run("uci\nisready\nposition startpos moves e2e4 c7c5\nd\nquit\n");
+    let out = run("uci\nisready\nposition startpos moves e2e4 c7c5\nd\ngo depth 3\nquit\n");
     assert!(out.starts_with("id name Fishrod "), "{out}");
     assert!(out.contains("\nuciok\nreadyok\n"), "{out}");
     assert!(
         out.contains("FEN: rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2"),
+        "{out}"
+    );
+    assert!(out.contains("\ninfo depth 3 "), "{out}");
+    assert!(
+        out.lines().last().unwrap().starts_with("bestmove "),
         "{out}"
     );
 }
