@@ -43,6 +43,20 @@ impl Square {
         self.0 / 8
     }
 
+    /// The square `file_step` files and `rank_step` ranks away, or `None` if
+    /// that is off the board. Positive steps go towards the h-file and rank 8.
+    pub const fn offset(self, file_step: i8, rank_step: i8) -> Option<Square> {
+        // Stepping left of the a-file wraps around to a large number, so a
+        // single `< 8` test catches both edges.
+        let file = self.file().wrapping_add_signed(file_step);
+        let rank = self.rank().wrapping_add_signed(rank_step);
+        if file < 8 && rank < 8 {
+            Some(Square::from_coords(file, rank))
+        } else {
+            None
+        }
+    }
+
     /// All squares from a1 to h8, in index order.
     pub fn all() -> impl Iterator<Item = Square> {
         (0..64).map(Square)
@@ -150,6 +164,19 @@ mod tests {
             assert_eq!(Square::new(sq.index() as u8), sq);
         }
         assert_eq!(Square::all().count(), Square::COUNT);
+    }
+
+    #[test]
+    fn offset_stays_on_the_board() {
+        assert_eq!(Square::E4.offset(1, 2), Some(Square::F6));
+        assert_eq!(Square::E4.offset(-4, -3), Some(Square::A1));
+        assert_eq!(Square::E4.offset(0, 0), Some(Square::E4));
+        assert_eq!(Square::A1.offset(-1, 0), None);
+        assert_eq!(Square::A1.offset(0, -1), None);
+        assert_eq!(Square::H8.offset(0, 1), None);
+        // h1 plus one file must not wrap around to a2.
+        assert_eq!(Square::H1.offset(1, 0), None);
+        assert_eq!(Square::G1.offset(2, 1), None);
     }
 
     #[test]

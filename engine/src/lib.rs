@@ -6,7 +6,10 @@
 #![deny(unsafe_code)]
 
 pub mod board;
+pub mod movegen;
 pub mod types;
+
+mod rng;
 
 /// Engine name reported to user interfaces.
 pub const NAME: &str = "Fishrod";
