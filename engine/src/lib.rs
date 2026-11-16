@@ -5,6 +5,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod board;
 pub mod types;
 
 /// Engine name reported to user interfaces.
