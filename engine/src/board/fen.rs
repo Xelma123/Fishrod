@@ -122,14 +122,6 @@ impl Position {
     }
 }
 
-/// The rank a color's pieces start on: 0 (first rank) for white, 7 for black.
-fn back_rank(color: Color) -> u8 {
-    match color {
-        Color::White => 0,
-        Color::Black => 7,
-    }
-}
-
 /// The rook furthest from the king on the given side, if there is one.
 fn outermost_rook(rooks: Bitboard, king: Square, side: CastlingSide) -> Option<Square> {
     let mut on_side = rooks.into_iter().filter(|rook| match side {
@@ -204,7 +196,7 @@ fn parse_castling(pos: &mut Position, text: &str) -> Result<(), FenError> {
         } else {
             Color::Black
         };
-        let back_rank = back_rank(color);
+        let back_rank = color.back_rank();
         let king = pos.king_square(color);
         if king.rank() != back_rank {
             return Err(invalid());
@@ -270,7 +262,7 @@ fn castling_field(pos: &Position) -> String {
     let mut field = String::new();
     for color in Color::ALL {
         let king = pos.king_square(color);
-        let rooks = pos.pieces_of(color, PieceType::Rook) & Bitboard::rank(back_rank(color));
+        let rooks = pos.pieces_of(color, PieceType::Rook) & Bitboard::rank(color.back_rank());
         for side in CastlingSide::ALL {
             let Some(rook) = pos.castling_rook(color, side) else {
                 continue;

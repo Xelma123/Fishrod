@@ -27,6 +27,14 @@ impl Color {
             Color::Black => Color::White,
         }
     }
+
+    /// The rank this color's pieces start on: 0 (first rank) for white, 7 for black.
+    pub const fn back_rank(self) -> u8 {
+        match self {
+            Color::White => 0,
+            Color::Black => 7,
+        }
+    }
 }
 
 impl Not for Color {

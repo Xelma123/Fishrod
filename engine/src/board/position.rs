@@ -2,6 +2,9 @@
 
 use std::fmt;
 
+use crate::movegen::attacks::{
+    bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks,
+};
 use crate::types::{Bitboard, Color, Piece, PieceType, Square};
 
 /// The side of the board a castling move goes to.
@@ -16,6 +19,25 @@ pub enum CastlingSide {
 impl CastlingSide {
     /// Both sides, in index order.
     pub const ALL: [CastlingSide; 2] = [CastlingSide::King, CastlingSide::Queen];
+
+    /// Where the king ends up after castling: the g-file or the c-file of its
+    /// back rank, in Chess960 as in standard chess.
+    pub const fn king_destination(self, color: Color) -> Square {
+        let file = match self {
+            CastlingSide::King => 6,
+            CastlingSide::Queen => 2,
+        };
+        Square::from_coords(file, color.back_rank())
+    }
+
+    /// Where the rook ends up after castling: the f-file or the d-file.
+    pub const fn rook_destination(self, color: Color) -> Square {
+        let file = match self {
+            CastlingSide::King => 5,
+            CastlingSide::Queen => 3,
+        };
+        Square::from_coords(file, color.back_rank())
+    }
 }
 
 /// Index into `Position::castling_rooks` for a color and a castling side.
@@ -132,6 +154,27 @@ impl Position {
         self.fullmove_number
     }
 
+    /// Pieces of either color that attack `sq`. Sliders are traced through
+    /// `occupied` instead of the real occupancy, which answers questions such
+    /// as "would this square be attacked if the king stepped off its square?".
+    pub fn attackers_to(&self, sq: Square, occupied: Bitboard) -> Bitboard {
+        let bishops_queens = self.pieces(PieceType::Bishop) | self.pieces(PieceType::Queen);
+        let rooks_queens = self.pieces(PieceType::Rook) | self.pieces(PieceType::Queen);
+        // A white pawn attacks `sq` from the squares a black pawn on `sq` would attack, and the other way round.
+        (pawn_attacks(Color::Black, sq) & self.pieces_of(Color::White, PieceType::Pawn))
+            | (pawn_attacks(Color::White, sq) & self.pieces_of(Color::Black, PieceType::Pawn))
+            | (knight_attacks(sq) & self.pieces(PieceType::Knight))
+            | (king_attacks(sq) & self.pieces(PieceType::King))
+            | (bishop_attacks(sq, occupied) & bishops_queens)
+            | (rook_attacks(sq, occupied) & rooks_queens)
+    }
+
+    /// The enemy pieces giving check to the side to move.
+    pub fn checkers(&self) -> Bitboard {
+        let us = self.side_to_move;
+        self.attackers_to(self.king_square(us), self.occupied()) & self.occupied_by(!us)
+    }
+
     /// Whether the bitboards and the square table describe the same placement.
     /// Tests call this after building or changing a position.
     pub fn is_consistent(&self) -> bool {
@@ -153,6 +196,17 @@ impl Position {
         self.board[sq.index()] = Some(piece);
         self.by_type[piece.piece_type().index()] |= bit;
         self.by_color[piece.color().index()] |= bit;
+    }
+
+    /// Takes the piece off `sq`, which must hold one, and returns it.
+    pub(super) fn remove_piece(&mut self, sq: Square) -> Piece {
+        let Some(piece) = self.board[sq.index()].take() else {
+            panic!("no piece to remove on {sq}");
+        };
+        let bit = Bitboard::from_square(sq);
+        self.by_type[piece.piece_type().index()] ^= bit;
+        self.by_color[piece.color().index()] ^= bit;
+        piece
     }
 
     /// Whether the side to move could capture en passant on `sq`: the square is
@@ -247,6 +301,57 @@ mod tests {
         assert_eq!(pos.en_passant(), None);
         assert_eq!((pos.halfmove_clock(), pos.fullmove_number()), (0, 1));
         assert!(pos.is_consistent());
+    }
+
+    #[test]
+    fn attackers_and_checkers() {
+        // The rook on e4 checks the king on e2.
+        let pos = Position::from_fen("4k3/8/8/8/4r3/8/4K3/8 w - - 0 1").unwrap();
+        let black = pos.occupied_by(Color::Black);
+        let white = pos.occupied_by(Color::White);
+        assert_eq!(pos.checkers(), Bitboard::from_square(Square::E4));
+        // e1 is shielded by the king itself, until the king steps off e2.
+        assert!((pos.attackers_to(Square::E1, pos.occupied()) & black).is_empty());
+        assert_eq!(
+            pos.attackers_to(Square::E1, pos.occupied().without(Square::E2)) & black,
+            Bitboard::from_square(Square::E4)
+        );
+        assert_eq!(
+            pos.attackers_to(Square::E1, pos.occupied()) & white,
+            Bitboard::from_square(Square::E2)
+        );
+
+        // Pawns attack diagonally forward: d5 is attacked by e4, e4 by d5.
+        let pos = Position::from_fen("4k3/8/8/3p4/4P3/8/8/4K3 w - - 0 1").unwrap();
+        assert_eq!(
+            pos.attackers_to(Square::D5, pos.occupied()),
+            Bitboard::from_square(Square::E4)
+        );
+        assert_eq!(
+            pos.attackers_to(Square::E4, pos.occupied()),
+            Bitboard::from_square(Square::D5)
+        );
+        assert!(pos.checkers().is_empty());
+    }
+
+    #[test]
+    fn castling_destinations() {
+        assert_eq!(
+            CastlingSide::King.king_destination(Color::White),
+            Square::G1
+        );
+        assert_eq!(
+            CastlingSide::King.rook_destination(Color::White),
+            Square::F1
+        );
+        assert_eq!(
+            CastlingSide::Queen.king_destination(Color::Black),
+            Square::C8
+        );
+        assert_eq!(
+            CastlingSide::Queen.rook_destination(Color::Black),
+            Square::D8
+        );
     }
 
     #[test]

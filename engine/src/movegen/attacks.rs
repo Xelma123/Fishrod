@@ -9,6 +9,8 @@
 //! Attack sets include occupied squares of either color. Callers remove their
 //! own pieces when they need moves rather than attacks.
 
+use std::sync::LazyLock;
+
 use super::magic::SLIDERS;
 use crate::types::{Bitboard, Color, Square};
 
@@ -24,7 +26,8 @@ const KNIGHT_STEPS: [(i8, i8); 8] = [
     (-1, 2),
 ];
 
-/// King steps to the eight neighbouring squares.
+/// King steps to the eight neighbouring squares. They are also the eight
+/// directions of the lines through a square: rank, file and both diagonals.
 const KING_STEPS: [(i8, i8); 8] = [
     (0, 1),
     (1, 1),
@@ -44,6 +47,11 @@ static KNIGHT_ATTACKS: [Bitboard; 64] = leaper_table(&KNIGHT_STEPS);
 static KING_ATTACKS: [Bitboard; 64] = leaper_table(&KING_STEPS);
 static PAWN_ATTACKS: [[Bitboard; 64]; 2] =
     [leaper_table(&PAWN_STEPS[0]), leaper_table(&PAWN_STEPS[1])];
+
+/// For each pair of squares: the squares strictly between them.
+static BETWEEN: [[Bitboard; 64]; 64] = square_pair_table(false);
+/// For each pair of squares: the whole line through both, edge to edge.
+static LINE: [[Bitboard; 64]; 64] = square_pair_table(true);
 
 /// Builds the attack table of a piece that moves by fixed steps, leaving out
 /// steps that would leave the board. Runs at compile time.
@@ -66,6 +74,63 @@ const fn leaper_table(steps: &[(i8, i8)]) -> [Bitboard; 64] {
         index += 1;
     }
     table
+}
+
+/// Builds `BETWEEN` (when `whole_line` is false) or `LINE`. Pairs that share
+/// no rank, file or diagonal get the empty set. Runs at compile time.
+const fn square_pair_table(whole_line: bool) -> [[Bitboard; 64]; 64] {
+    let mut table = [[Bitboard::EMPTY; 64]; 64];
+    let mut index = 0;
+    while index < 64 {
+        let from = Square::new(index as u8);
+        let mut d = 0;
+        while d < KING_STEPS.len() {
+            let (file_step, rank_step) = KING_STEPS[d];
+            let forward = ray(from, file_step, rank_step);
+            let backward = ray(from, -file_step, -rank_step);
+            let line = Bitboard(forward.0 | backward.0).with(from);
+            // Walk away from `from`, remembering the squares passed so far.
+            let mut passed = Bitboard::EMPTY;
+            let mut current = from;
+            while let Some(next) = current.offset(file_step, rank_step) {
+                table[index][next.index()] = if whole_line { line } else { passed };
+                passed = passed.with(next);
+                current = next;
+            }
+            d += 1;
+        }
+        index += 1;
+    }
+    table
+}
+
+/// The squares from `from` (not included) to the edge of the board in one direction.
+const fn ray(from: Square, file_step: i8, rank_step: i8) -> Bitboard {
+    let mut squares = Bitboard::EMPTY;
+    let mut current = from;
+    while let Some(next) = current.offset(file_step, rank_step) {
+        squares = squares.with(next);
+        current = next;
+    }
+    squares
+}
+
+/// Builds the bishop and rook tables now rather than on first use, so the
+/// first search or perft does not pay for it.
+pub fn init() {
+    LazyLock::force(&SLIDERS);
+}
+
+/// The squares strictly between `a` and `b` when they share a rank, file or
+/// diagonal; the empty set otherwise.
+pub fn between(a: Square, b: Square) -> Bitboard {
+    BETWEEN[a.index()][b.index()]
+}
+
+/// The whole rank, file or diagonal through `a` and `b`, edge to edge, when
+/// they share one; the empty set otherwise, and when `a == b`.
+pub fn line(a: Square, b: Square) -> Bitboard {
+    LINE[a.index()][b.index()]
 }
 
 /// Squares a pawn of `color` on `sq` attacks.
@@ -225,5 +290,51 @@ mod tests {
             bishop_total += bishop.popcount();
         }
         assert_eq!(bishop_total, 560);
+    }
+
+    #[test]
+    fn between_examples() {
+        use Square as S;
+        assert_eq!(
+            between(S::A1, S::H8),
+            set(&[S::B2, S::C3, S::D4, S::E5, S::F6, S::G7])
+        );
+        assert_eq!(between(S::E1, S::E4), set(&[S::E2, S::E3]));
+        assert_eq!(between(S::H3, S::E3), set(&[S::F3, S::G3]));
+        assert!(between(S::E4, S::E5).is_empty());
+        // A knight's jump apart: no common line.
+        assert!(between(S::A1, S::B3).is_empty());
+        assert!(between(S::E4, S::E4).is_empty());
+    }
+
+    #[test]
+    fn line_examples() {
+        use Square as S;
+        let long_diagonal = between(S::A1, S::H8).with(S::A1).with(S::H8);
+        assert_eq!(line(S::C3, S::E5), long_diagonal);
+        assert_eq!(line(S::E7, S::E2), Bitboard::FILE_E);
+        assert_eq!(line(S::B6, S::G6), Bitboard::RANK_6);
+        assert_eq!(line(S::G1, S::H2), set(&[S::G1, S::H2]));
+        assert!(line(S::A1, S::B3).is_empty());
+        assert!(line(S::E4, S::E4).is_empty());
+    }
+
+    #[test]
+    fn square_pair_tables_agree_with_each_other() {
+        for a in Square::all() {
+            for b in Square::all() {
+                assert_eq!(between(a, b), between(b, a));
+                assert_eq!(line(a, b), line(b, a));
+                // Two squares share a line exactly when a queen on one sees the other.
+                let aligned = queen_attacks(a, Bitboard::EMPTY).contains(b);
+                assert_eq!(!line(a, b).is_empty(), aligned, "{a} {b}");
+                if aligned {
+                    assert!(line(a, b).contains(a) && line(a, b).contains(b));
+                    assert_eq!(between(a, b) & line(a, b), between(a, b));
+                } else {
+                    assert!(between(a, b).is_empty());
+                }
+            }
+        }
     }
 }
