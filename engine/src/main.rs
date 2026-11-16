@@ -9,15 +9,14 @@ use fishrod::board::{CastlingSide, Position};
 use fishrod::movegen::{attacks, perft};
 use fishrod::types::{Color, Square};
 
-const USAGE: &str = "usage: fishrod [perft <depth> [<fen>]]";
+const USAGE: &str = "\
+usage: fishrod                      UCI mode, for chess GUIs
+       fishrod perft <depth> [<fen>]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
-        None => {
-            println!("{} {}", fishrod::NAME, fishrod::VERSION);
-            Ok(())
-        }
+        None => fishrod::uci::run().map_err(|err| format!("I/O error: {err}")),
         Some("perft") => run_perft(&args[1..]),
         Some(other) => Err(format!("unknown command '{other}'")),
     };
