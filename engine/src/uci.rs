@@ -5,8 +5,9 @@
 use std::io::{self, BufRead, Write};
 
 use crate::board::Position;
+use crate::eval::evaluate;
 use crate::movegen::legal_moves;
-use crate::types::{Move, MoveKind};
+use crate::types::{Color, Move, MoveKind};
 
 /// Largest accepted `Hash` value, in MiB.
 const HASH_MAX: u64 = 65_536;
@@ -77,7 +78,19 @@ impl Uci {
                 }
             }
             // Not part of UCI: shows the current position, for debugging by hand.
-            "d" => writeln!(out, "{}\nKey: {:016x}", self.position, self.position.key())?,
+            "d" => {
+                let score = evaluate(&self.position);
+                let white_view = match self.position.side_to_move() {
+                    Color::White => score,
+                    Color::Black => -score,
+                };
+                writeln!(
+                    out,
+                    "{}\nKey: {:016x}\nEval: {white_view:+} cp (white's point of view)",
+                    self.position,
+                    self.position.key()
+                )?;
+            }
             "quit" => return Ok(Flow::Quit),
             _ => writeln!(out, "info string unknown command '{command}'")?,
         }
