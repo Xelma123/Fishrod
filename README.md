@@ -1,0 +1,55 @@
+# Fishrod
+
+Fishrod is a UCI chess engine written from scratch in Rust.
+
+**Status:** Early development. Phase 1 of 7 (board representation and move generation) is in progress, and the engine is not yet playable.
+
+## Design
+
+- **Board representation:** bitboards, with magic bitboards for sliding-piece attacks. Move generation produces only legal moves, is verified with perft and supports Chess960.
+- **Search:** alpha-beta with principal variation search, iterative deepening, quiescence search, a transposition table, and pruning and reduction techniques.
+- **Evaluation:** a hand-crafted evaluation at first, later replaced by an NNUE network trained exclusively on positions from Fishrod's own self-play games.
+
+The board, move generation, search, evaluation and network inference are original work; no code is taken from other engines. Ideas adopted from published work are credited in the commit history.
+
+## Building
+
+Fishrod requires a stable Rust toolchain that supports the 2024 edition.
+
+```sh
+cargo build --release
+```
+
+The binary is written to `target/release/fishrod` (`fishrod.exe` on Windows). To optimize for the processor of the build machine, set `RUSTFLAGS="-C target-cpu=native"` before building.
+
+## Usage
+
+Fishrod communicates through the Universal Chess Interface (UCI) and is intended to be used with a UCI-compatible graphical interface such as Cute Chess, Arena or En Croissant. It also provides commands for development:
+
+| Command | Description |
+|---|---|
+| `fishrod` | Starts the engine in UCI mode. |
+| `fishrod perft <depth> [fen]` | Counts the leaf nodes of the move tree to the given depth and prints the count for each root move. |
+| `fishrod bench` | Searches a fixed set of positions to a fixed depth and prints the total node count and speed. |
+
+Each command becomes available when the corresponding phase of the roadmap is complete.
+
+## Testing
+
+- **Perft:** move generation is checked against published node counts for standard and Chess960 test positions.
+- **Bench:** the node count of the fixed-depth benchmark is deterministic and is recorded in each commit message as `Bench: <nodes>`. A change that is not intended to alter search behavior must leave it unchanged.
+- **SPRT:** every change that may affect playing strength is tested in engine-versus-engine matches with a sequential probability ratio test before it is merged.
+
+## Roadmap
+
+1. Board representation and legal move generation
+2. UCI protocol, alpha-beta search and a hand-crafted evaluation
+3. Testing infrastructure for SPRT
+4. Search improvements: transposition table, move ordering, pruning and reductions
+5. NNUE evaluation trained on self-play data
+6. Experimental features, developed behind Cargo feature flags
+7. Multithreaded search (Lazy SMP), endgame tablebases and release builds
+
+## License
+
+Fishrod is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE).

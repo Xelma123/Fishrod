@@ -1,0 +1,34 @@
+# Rust derleme çıktıları
+/target/
+**/target/
+
+# Büyük ve üretilen dosyalar (git'e girmez; Kaggle çıktılarında yaşar)
+/data/
+/checkpoints/
+/games/
+/nets/*.nnue
+*.binpack
+*.vf
+
+# Test araçları ve açılış setleri (indirilir, depoya konmaz)
+/tools/bin/
+/books/
+
+# Claude Code kişisel ayarları
+.claude/settings.local.json
+
+# Defter ve işletim sistemi artıkları
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+
+#Agentic Ai Setup
+CLAUDE.md
+
+KURULUM.md
+
+BASLANGIC_PROMPTU.md
+
+docs/
+
+DEVIR.md
