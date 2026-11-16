@@ -7,16 +7,20 @@
 //! which then prints its `bestmove`.
 
 use std::fmt::Display;
+use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::board::Position;
 use crate::eval::evaluate;
 use crate::movegen::legal_moves;
+use crate::rng::Rng;
+use crate::search::strength::Strength;
 use crate::search::{Limits, Report, mate_in, search};
 use crate::types::{Color, Move, MoveKind};
 
@@ -50,6 +54,12 @@ struct Uci<W> {
     chess960: bool,
     /// `Move Overhead`, in milliseconds.
     move_overhead: u64,
+    /// `UCI_LimitStrength`: play at the strength set by `UCI_Elo`.
+    limit_strength: bool,
+    /// `UCI_Elo`.
+    elo: u32,
+    /// `GameLog`: the file each move is recorded in, if any.
+    game_log: Option<PathBuf>,
     /// Shared with the search thread, which prints its own lines.
     out: Arc<Mutex<W>>,
     /// The running or finished search that has not been waited for yet.
@@ -108,6 +118,9 @@ impl<W: Write + Send + 'static> Uci<W> {
             history: Vec::new(),
             chess960: false,
             move_overhead: MOVE_OVERHEAD_DEFAULT,
+            limit_strength: false,
+            elo: Strength::DEFAULT_ELO,
+            game_log: None,
             out: Arc::new(Mutex::new(out)),
             search: None,
         }
@@ -178,6 +191,14 @@ impl<W: Write + Send + 'static> Uci<W> {
             "option name Move Overhead type spin default {MOVE_OVERHEAD_DEFAULT} min 0 max {MOVE_OVERHEAD_MAX}"
         ))?;
         self.say("option name UCI_Chess960 type check default false")?;
+        self.say("option name UCI_LimitStrength type check default false")?;
+        self.say(format_args!(
+            "option name UCI_Elo type spin default {} min {} max {}",
+            Strength::DEFAULT_ELO,
+            Strength::MIN_ELO,
+            Strength::MAX_ELO
+        ))?;
+        self.say("option name GameLog type string default <empty>")?;
         self.say("uciok")
     }
 
@@ -189,7 +210,15 @@ impl<W: Write + Send + 'static> Uci<W> {
             Ok(command) => command,
             Err(err) => return self.say(format_args!("info string {err}")),
         };
-        let limits = command.limits(self.position.side_to_move(), self.move_overhead);
+        let mut limits = command.limits(self.position.side_to_move(), self.move_overhead);
+        let strength = self.limit_strength.then(|| Strength::new(self.elo));
+        if let Some(strength) = strength {
+            let depth = limits
+                .depth
+                .map_or(strength.depth(), |d| d.min(strength.depth()));
+            limits.depth = Some(depth);
+            limits.exact_root_scores = true;
+        }
 
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
@@ -197,15 +226,29 @@ impl<W: Write + Send + 'static> Uci<W> {
         let position = self.position;
         let history = self.history.clone();
         let chess960 = self.chess960;
+        let game_log = self.game_log.clone();
         let infinite = command.infinite;
         let unbounded = infinite
             || (limits.depth.is_none() && limits.nodes.is_none() && limits.hard_time.is_none());
         let handle = thread::spawn(move || {
             // If the output is gone, so is the GUI: there is no one left to
             // tell, so write errors are ignored here.
+            let start = Instant::now();
             let outcome = search(&position, &history, limits, &thread_stop, |report| {
                 let _ = write_line(&out, info_line(report, chess960));
             });
+            let time = start.elapsed();
+            let played = match strength {
+                Some(strength) => {
+                    // Seeded from the clock, so a weakened engine does not
+                    // repeat itself from game to game.
+                    let mut rng = Rng::new(position.key() ^ clock_seed());
+                    strength
+                        .choose(&outcome.root_scores, &mut rng)
+                        .or(outcome.best_move)
+                }
+                None => outcome.best_move,
+            };
             // After `go infinite` the GUI expects `bestmove` only once it has
             // sent `stop`, even if the search ends by itself.
             if infinite {
@@ -214,9 +257,23 @@ impl<W: Write + Send + 'static> Uci<W> {
                 }
             }
             // "0000" is the UCI null move, for a position without legal moves.
-            let best = outcome
-                .best_move
-                .map_or_else(|| "0000".to_string(), |mv| mv.to_uci(chess960));
+            let best = played.map_or_else(|| "0000".to_string(), |mv| mv.to_uci(chess960));
+            if let Some(path) = &game_log {
+                let entry = format!(
+                    "{};{best};{};{};{};{}",
+                    position.to_fen(),
+                    score_text(outcome.score),
+                    outcome.depth,
+                    outcome.nodes,
+                    time.as_millis()
+                );
+                if let Err(err) = append_line(path, &entry) {
+                    let _ = write_line(
+                        &out,
+                        format_args!("info string cannot write the game log: {err}"),
+                    );
+                }
+            }
             let _ = write_line(&out, format_args!("bestmove {best}"));
         });
         self.search = Some(SearchThread {
@@ -311,6 +368,16 @@ impl<W: Write + Send + 'static> Uci<W> {
             }
             "move overhead" => self.move_overhead = parse_spin(&value, 0, MOVE_OVERHEAD_MAX)?,
             "uci_chess960" => self.chess960 = parse_check(&value)?,
+            "uci_limitstrength" => self.limit_strength = parse_check(&value)?,
+            "uci_elo" => {
+                let elo = parse_spin(&value, Strength::MIN_ELO.into(), Strength::MAX_ELO.into())?;
+                self.elo = elo as u32;
+            }
+            // An empty value, or the "<empty>" placeholder, turns the log off.
+            "gamelog" => {
+                self.game_log =
+                    (!value.is_empty() && value != "<empty>").then(|| PathBuf::from(&value));
+            }
             _ => return Err(format!("unknown option '{name}'")),
         }
         Ok(())
@@ -415,14 +482,32 @@ fn parse_number<T: FromStr>(token: Option<&str>, name: &str) -> Result<T, String
         .ok_or_else(|| format!("'{name}' needs a whole number"))
 }
 
+/// A score as UCI writes it: `cp <centipawns>` or `mate <moves>`.
+fn score_text(score: i32) -> String {
+    match mate_in(score) {
+        Some(moves) => format!("mate {moves}"),
+        None => format!("cp {score}"),
+    }
+}
+
+/// Appends one line to the file at `path`, creating the file if needed.
+fn append_line(path: &Path, line: &str) -> io::Result<()> {
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{line}")
+}
+
+/// A seed that differs from one call to the next, taken from the clock.
+fn clock_seed() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos() as u64)
+}
+
 /// The `info` line for a completed iteration.
 fn info_line(report: &Report, chess960: bool) -> String {
     let millis = report.time.as_millis();
     let nps = u128::from(report.nodes) * 1000 / millis.max(1);
-    let score = match mate_in(report.score) {
-        Some(moves) => format!("mate {moves}"),
-        None => format!("cp {}", report.score),
-    };
+    let score = score_text(report.score);
     let pv: Vec<String> = report.pv.iter().map(|mv| mv.to_uci(chess960)).collect();
     format!(
         "info depth {} score {score} nodes {} nps {nps} time {millis} pv {}",
@@ -484,7 +569,63 @@ mod tests {
         assert!(out.starts_with("id name Fishrod "));
         assert!(out.contains("\noption name Move Overhead type spin default 10 min 0 max 5000\n"));
         assert!(out.contains("\noption name UCI_Chess960 type check default false\n"));
+        assert!(out.contains("\noption name UCI_LimitStrength type check default false\n"));
+        assert!(out.contains("\noption name UCI_Elo type spin default 1500 min 500 max 2000\n"));
+        assert!(out.contains("\noption name GameLog type string default <empty>\n"));
         assert!(out.ends_with("uciok\nreadyok\n"));
+    }
+
+    #[test]
+    fn limited_strength_searches_shallow_but_takes_a_mate() {
+        let weakest = "setoption name UCI_LimitStrength value true\n\
+                       setoption name UCI_Elo value 500\n";
+        let (_, out) = session(&format!(
+            "{weakest}position startpos\ngo wtime 10000 btime 10000"
+        ));
+        assert!(out.contains("info depth 1 "), "{out}");
+        assert!(!out.contains("info depth 2 "), "{out}");
+        assert!(
+            out.lines().last().unwrap().starts_with("bestmove "),
+            "{out}"
+        );
+
+        // A mate scores far beyond any margin, so even the weakest setting plays it.
+        let (_, out) = session(&format!(
+            "{weakest}position fen 6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1\ngo depth 5"
+        ));
+        assert!(out.ends_with("bestmove a1a8\n"), "{out}");
+    }
+
+    #[test]
+    fn game_log_records_each_move() {
+        let path = std::env::temp_dir().join(format!("fishrod-gamelog-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // Like a GUI, wait for each move before sending the next position:
+        // a new `position` would stop the running search.
+        let mut uci = Uci::new(Vec::new());
+        uci.handle(&format!("setoption name GameLog value {}", path.display()))
+            .unwrap();
+        for position in ["position startpos", "position startpos moves e2e4"] {
+            uci.handle(position).unwrap();
+            uci.handle("go depth 2").unwrap();
+            uci.wait_for_search();
+        }
+        assert_eq!(uci.game_log.as_deref(), Some(path.as_path()));
+        let log = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        let fields: Vec<&str> = lines[0].split(';').collect();
+        assert_eq!(fields[0], Position::STARTPOS_FEN);
+        assert_eq!(fields[3], "2");
+        assert!(fields[2].starts_with("cp "));
+        assert!(
+            lines[1].starts_with("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1;")
+        );
+
+        let (uci, _) =
+            session("setoption name GameLog value x.txt\nsetoption name GameLog value <empty>");
+        assert_eq!(uci.game_log, None);
     }
 
     #[test]

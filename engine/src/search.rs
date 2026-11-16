@@ -14,6 +14,7 @@
 //! come early.
 
 mod ordering;
+pub(crate) mod strength;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -62,6 +63,10 @@ pub struct Limits {
     pub soft_time: Option<Duration>,
     /// The search stops once this much time has passed, even mid-iteration.
     pub hard_time: Option<Duration>,
+    /// Search every root move with a full window, so that each one gets an
+    /// exact score in `Outcome::root_scores`. Slower: there are no cutoffs at
+    /// the root. Used to play below full strength.
+    pub exact_root_scores: bool,
 }
 
 /// The result of one completed iteration, for progress output.
@@ -75,7 +80,7 @@ pub struct Report<'a> {
 }
 
 /// What the search decided.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Outcome {
     /// `None` when the root position has no legal moves.
     pub best_move: Option<Move>,
@@ -83,6 +88,9 @@ pub struct Outcome {
     /// The deepest completed iteration.
     pub depth: u32,
     pub nodes: u64,
+    /// Every root move with its exact score from the deepest completed
+    /// iteration, if `Limits::exact_root_scores` was set; empty otherwise.
+    pub root_scores: Vec<(Move, i32)>,
 }
 
 /// Searches `root` within `limits` and returns the best move found.
@@ -110,6 +118,8 @@ pub fn search(
         stopped: false,
         path: history.to_vec(),
         prev_pv: MoveList::new(),
+        exact_root: limits.exact_root_scores,
+        root_scores: Vec::new(),
     };
 
     // Until an iteration completes, any legal move will have to do.
@@ -119,6 +129,7 @@ pub fn search(
         score: DRAW,
         depth: 0,
         nodes: 0,
+        root_scores: Vec::new(),
     };
     if outcome.best_move.is_none() {
         if !root.checkers().is_empty() {
@@ -143,6 +154,7 @@ pub fn search(
             score,
             depth,
             nodes: searcher.nodes,
+            root_scores: std::mem::take(&mut searcher.root_scores),
         };
         report(&Report {
             depth,
@@ -184,6 +196,10 @@ struct Searcher<'a> {
     path: Vec<u64>,
     /// The principal variation of the previous iteration, tried first.
     prev_pv: MoveList,
+    /// Whether root moves get a full window (`Limits::exact_root_scores`).
+    exact_root: bool,
+    /// Root moves and their scores in the current iteration, when `exact_root` is set.
+    root_scores: Vec<(Move, i32)>,
 }
 
 impl Searcher<'_> {
@@ -250,21 +266,35 @@ impl Searcher<'_> {
         } else {
             None
         };
+        // With exact root scores every root move gets the full window, so no
+        // move is merely shown to be worse than the best: each is scored.
+        let exact = ply == 0 && self.exact_root;
+        if exact {
+            self.root_scores.clear();
+        }
         let mut best = -INFINITY;
         let mut child_pv = MoveList::new();
         self.path.push(pos.key());
         for mv in OrderedMoves::new(pos, moves, pv_move) {
+            let (child_alpha, child_beta) = if exact {
+                (-INFINITY, INFINITY)
+            } else {
+                (-beta, -alpha)
+            };
             let score = -self.negamax(
                 &pos.make_move(mv),
                 depth - 1,
-                -beta,
-                -alpha,
+                child_alpha,
+                child_beta,
                 ply + 1,
                 Some(mv) == pv_move,
                 &mut child_pv,
             );
             if self.stopped {
                 break;
+            }
+            if exact {
+                self.root_scores.push((mv, score));
             }
             if score > best {
                 best = score;
@@ -521,6 +551,36 @@ mod tests {
             "{:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn exact_root_scores_cover_every_move() {
+        let pos = Position::from_fen("4k3/8/8/3q4/8/8/8/3RK3 w - - 0 1").unwrap();
+        let limits = Limits {
+            exact_root_scores: true,
+            ..depth(3)
+        };
+        let outcome = search_quietly(&pos, &[], limits);
+        assert_eq!(outcome.root_scores.len(), legal_moves(&pos).len());
+        let best = outcome.root_scores.iter().max_by_key(|&&(_, score)| score);
+        assert_eq!(best, Some(&(outcome.best_move.unwrap(), outcome.score)));
+        // Taking the queen is far better than any other move.
+        let others = outcome
+            .root_scores
+            .iter()
+            .filter(|&&(mv, _)| Some(mv) != outcome.best_move);
+        assert!(
+            others
+                .into_iter()
+                .all(|&(_, score)| score < outcome.score - 500)
+        );
+        // The same search without exact scores agrees on the move and score.
+        let plain = run("4k3/8/8/3q4/8/8/8/3RK3 w - - 0 1", 3);
+        assert_eq!(
+            (plain.best_move, plain.score),
+            (outcome.best_move, outcome.score)
+        );
+        assert!(plain.root_scores.is_empty());
     }
 
     #[test]
