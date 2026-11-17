@@ -9,7 +9,8 @@
 //! search narrows the window to a single point for every move but the first:
 //! proving a move no better than the best so far is cheaper than scoring it.
 //! Null move pruning cuts off a node when even passing the turn, searched a
-//! few plies shallower, keeps the score at beta.
+//! few plies shallower, keeps the score at beta. Late move reductions search
+//! the quiet moves at the back of the list less deeply.
 //!
 //! When the depth runs out, a quiescence search keeps playing captures until
 //! the position is quiet, so that no position is judged in the middle of an
@@ -19,6 +20,7 @@
 //! position, across iterations and across searches.
 
 mod ordering;
+mod reductions;
 pub(crate) mod strength;
 mod tt;
 
@@ -26,6 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use self::ordering::{History, Killers, OrderedMoves, add_killer, history_bonus, tactical_score};
+use self::reductions::reduction as reduction_for;
 pub use self::tt::TranspositionTable;
 use self::tt::{Bound, Entry};
 use crate::board::Position;
@@ -49,6 +52,8 @@ const CHECK_INTERVAL: u64 = 1024;
 const NO_KILLERS: Killers = [Move::NULL; 2];
 /// The shallowest depth at which null move pruning is tried.
 const NULL_MOVE_MIN_DEPTH: i32 = 3;
+/// The shallowest depth at which late moves are reduced.
+const LMR_MIN_DEPTH: i32 = 3;
 
 /// The number of moves to a forced mate, if `score` announces one: positive
 /// when the side to move mates, negative when it gets mated.
@@ -409,20 +414,41 @@ impl Searcher<'_> {
                     &mut child_pv,
                 );
             } else {
+                // Late move reductions: a quiet move this far down the list
+                // is unlikely to be best, so it is first searched shallower.
+                // Never for a move that gives check or escapes one.
+                let mut reduction = 0;
+                if depth >= LMR_MIN_DEPTH && is_quiet && !in_check && child.checkers().is_empty() {
+                    reduction = reduction_for(depth, index) - i32::from(pv_node);
+                    reduction = reduction.clamp(0, depth - 2);
+                }
                 // Principal variation search: the first move is most likely
                 // the best, so a later move only has to be shown no better
                 // than alpha, which a null window around alpha does quickly.
-                // A move that does better is searched again with the full
-                // window, for its exact score and line.
                 score = -self.negamax(
                     &child,
-                    depth - 1,
+                    depth - 1 - reduction,
                     -alpha - 1,
                     -alpha,
                     ply + 1,
                     on_line,
                     &mut child_pv,
                 );
+                // A reduced move that beats alpha after all gets its full depth.
+                if reduction > 0 && score > alpha && !self.stopped {
+                    score = -self.negamax(
+                        &child,
+                        depth - 1,
+                        -alpha - 1,
+                        -alpha,
+                        ply + 1,
+                        on_line,
+                        &mut child_pv,
+                    );
+                }
+                // A move that does better than alpha at full depth is
+                // searched again with the full window, for its exact score
+                // and line.
                 if score > alpha && score < beta && !self.stopped {
                     score = -self.negamax(
                         &child,
