@@ -9,8 +9,9 @@
 //! search narrows the window to a single point for every move but the first:
 //! proving a move no better than the best so far is cheaper than scoring it.
 //! Null move pruning cuts off a node when even passing the turn, searched a
-//! few plies shallower, keeps the score at beta. Late move reductions search
-//! the quiet moves at the back of the list less deeply.
+//! few plies shallower, keeps the score at beta, and reverse futility pruning
+//! when the evaluation is far above beta near the leaves. Late move
+//! reductions search the quiet moves at the back of the list less deeply.
 //!
 //! When the depth runs out, a quiescence search keeps playing captures until
 //! the position is quiet, so that no position is judged in the middle of an
@@ -54,6 +55,10 @@ const NO_KILLERS: Killers = [Move::NULL; 2];
 const NULL_MOVE_MIN_DEPTH: i32 = 3;
 /// The shallowest depth at which late moves are reduced.
 const LMR_MIN_DEPTH: i32 = 3;
+/// Reverse futility pruning applies up to this depth, when the evaluation
+/// exceeds beta by this margin per ply left, in centipawns.
+const RFP_MAX_DEPTH: i32 = 6;
+const RFP_MARGIN: i32 = 80;
 
 /// The number of moves to a forced mate, if `score` announces one: positive
 /// when the side to move mates, negative when it gets mated.
@@ -320,18 +325,32 @@ impl Searcher<'_> {
 
         let mut child_pv = MoveList::new();
 
+        // The static evaluation, for the pruning below; only outside PV
+        // nodes and check, where the pruning applies.
+        let static_eval = (!pv_node && !in_check).then(|| evaluate(pos));
+
+        // Reverse futility pruning: near the leaves, a position already far
+        // above beta is unlikely to drop below it in the few plies left, so
+        // the evaluation is taken as the score. Not when beta is a mate score.
+        if let Some(eval) = static_eval
+            && depth <= RFP_MAX_DEPTH
+            && mate_in(beta).is_none()
+            && eval - RFP_MARGIN * depth >= beta
+        {
+            return eval;
+        }
+
         // Null move pruning: let the opponent move twice in a row. If a
         // shallower search shows that even then the score stays at beta or
         // above, a real move would almost surely do as well: cut off. Not in
         // check (the king could be taken), not right after another pass, and
         // not with only pawns left besides the king, where having to move can
         // be a burden (zugzwang) and passing would flatter the position.
-        if !pv_node
-            && !in_check
+        if let Some(eval) = static_eval
+            && eval >= beta
             && depth >= NULL_MOVE_MIN_DEPTH
             && self.null_child_ply != Some(ply)
             && has_pieces(pos)
-            && evaluate(pos) >= beta
         {
             let reduction = 3 + depth / 4;
             let saved = self.null_child_ply.replace(ply + 1);
