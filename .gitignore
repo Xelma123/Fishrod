@@ -14,6 +14,9 @@
 /tools/bin/
 /books/
 
+# Paylaşmak için hazırlanan paketler
+/dist/
+
 # Claude Code kişisel ayarları
 .claude/settings.local.json
 
