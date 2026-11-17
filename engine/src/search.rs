@@ -8,6 +8,8 @@
 //! the remaining moves need not be searched: a cutoff. Principal variation
 //! search narrows the window to a single point for every move but the first:
 //! proving a move no better than the best so far is cheaper than scoring it.
+//! Null move pruning cuts off a node when even passing the turn, searched a
+//! few plies shallower, keeps the score at beta.
 //!
 //! When the depth runs out, a quiescence search keeps playing captures until
 //! the position is quiet, so that no position is judged in the middle of an
@@ -45,6 +47,8 @@ const DRAW: i32 = 0;
 const CHECK_INTERVAL: u64 = 1024;
 /// No killer moves, for a fresh ply and for quiescence.
 const NO_KILLERS: Killers = [Move::NULL; 2];
+/// The shallowest depth at which null move pruning is tried.
+const NULL_MOVE_MIN_DEPTH: i32 = 3;
 
 /// The number of moves to a forced mate, if `score` announces one: positive
 /// when the side to move mates, negative when it gets mated.
@@ -133,6 +137,7 @@ pub fn search(
         prev_pv: MoveList::new(),
         killers: [NO_KILLERS; MAX_PLY],
         quiet_history: History::new(),
+        null_child_ply: None,
         exact_root: limits.exact_root_scores,
         root_scores: Vec::new(),
     };
@@ -216,6 +221,9 @@ struct Searcher<'a> {
     killers: [Killers; MAX_PLY],
     /// The history scores of quiet moves, kept across iterations.
     quiet_history: History,
+    /// The ply of the node reached by a null move, while it is searched:
+    /// that node must not pass again.
+    null_child_ply: Option<usize>,
     /// Whether root moves get a full window (`Limits::exact_root_scores`).
     exact_root: bool,
     /// Root moves and their scores in the current iteration, when `exact_root` is set.
@@ -291,17 +299,60 @@ impl Searcher<'_> {
             }
         }
 
+        let in_check = !pos.checkers().is_empty();
         let moves = legal_moves(pos);
         if moves.is_empty() {
-            return if pos.checkers().is_empty() {
-                DRAW // stalemate
-            } else {
+            return if in_check {
                 -MATE + ply as i32
+            } else {
+                DRAW // stalemate
             };
         }
         // Checked after mate: a mate on the hundredth half-move still counts.
         if ply > 0 && pos.halfmove_clock() >= 100 {
             return DRAW;
+        }
+
+        let mut child_pv = MoveList::new();
+
+        // Null move pruning: let the opponent move twice in a row. If a
+        // shallower search shows that even then the score stays at beta or
+        // above, a real move would almost surely do as well: cut off. Not in
+        // check (the king could be taken), not right after another pass, and
+        // not with only pawns left besides the king, where having to move can
+        // be a burden (zugzwang) and passing would flatter the position.
+        if !pv_node
+            && !in_check
+            && depth >= NULL_MOVE_MIN_DEPTH
+            && self.null_child_ply != Some(ply)
+            && has_pieces(pos)
+            && evaluate(pos) >= beta
+        {
+            let reduction = 3 + depth / 4;
+            let saved = self.null_child_ply.replace(ply + 1);
+            self.path.push(pos.key());
+            let score = -self.negamax(
+                &pos.make_null_move(),
+                depth - 1 - reduction,
+                -beta,
+                -beta + 1,
+                ply + 1,
+                false,
+                &mut child_pv,
+            );
+            self.path.pop();
+            self.null_child_ply = saved;
+            if self.stopped {
+                return DRAW;
+            }
+            if score >= beta {
+                // A mate found after passing says nothing about real moves.
+                return if mate_in(score).is_some() {
+                    beta
+                } else {
+                    score
+                };
+            }
         }
 
         let pv_move = if on_pv {
@@ -321,7 +372,6 @@ impl Searcher<'_> {
         let original_alpha = alpha;
         let mut best = -INFINITY;
         let mut best_move = None;
-        let mut child_pv = MoveList::new();
         // Quiet moves searched without a cutoff, to be penalized if a later
         // move cuts off.
         let mut quiets_tried = MoveList::new();
@@ -515,6 +565,19 @@ impl Searcher<'_> {
             .step_by(2)
             .any(|distance| self.path[self.path.len() - distance] == pos.key())
     }
+}
+
+/// Whether the side to move has a knight, bishop, rook or queen.
+fn has_pieces(pos: &Position) -> bool {
+    let us = pos.side_to_move();
+    [
+        PieceType::Knight,
+        PieceType::Bishop,
+        PieceType::Rook,
+        PieceType::Queen,
+    ]
+    .into_iter()
+    .any(|piece_type| !pos.pieces_of(us, piece_type).is_empty())
 }
 
 /// Whether neither side has enough material left to mate: no pawns, rooks or
@@ -790,6 +853,16 @@ mod tests {
         let after_clear = search(&kiwipete, &[], depth(5), &tt, &stop, |_| {});
         assert_eq!(after_clear.nodes, first.nodes);
         assert_eq!(after_clear.best_move, first.best_move);
+    }
+
+    #[test]
+    fn null_moves_are_kept_out_of_pawn_endgames() {
+        let pawns_only = Position::from_fen("4k3/4p3/8/8/8/8/4P3/4K3 w - - 0 1").unwrap();
+        assert!(!has_pieces(&pawns_only));
+        // Only the side to move counts: white has a knight, black does not.
+        let knight = Position::from_fen("4k3/4p3/8/8/8/8/4P3/4KN2 w - - 0 1").unwrap();
+        assert!(has_pieces(&knight));
+        assert!(!has_pieces(&knight.make_null_move()));
     }
 
     #[test]

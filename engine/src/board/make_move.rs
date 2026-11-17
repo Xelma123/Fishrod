@@ -95,6 +95,30 @@ impl Position {
         }
         pos
     }
+
+    /// The position after passing: the same pieces, the other side to move.
+    /// Not a move of chess; the search uses it to ask whether a position is
+    /// so good that even passing keeps it good. The side to move must not be
+    /// in check, or its king could be taken.
+    ///
+    /// The halfmove clock starts again from zero, so that no position after
+    /// the pass counts as a repetition of one before it: passing is not
+    /// part of the game.
+    pub fn make_null_move(&self) -> Position {
+        debug_assert!(self.checkers().is_empty(), "passing while in check");
+        let mut pos = *self;
+        pos.key ^= black_to_move_key();
+        if let Some(sq) = self.en_passant {
+            pos.key ^= en_passant_key(sq);
+        }
+        pos.en_passant = None;
+        pos.halfmove_clock = 0;
+        if self.side_to_move == Color::Black {
+            pos.fullmove_number = pos.fullmove_number.saturating_add(1);
+        }
+        pos.side_to_move = !self.side_to_move;
+        pos
+    }
 }
 
 #[cfg(test)]
@@ -206,6 +230,27 @@ mod tests {
             ),
             "4k3/8/8/8/8/8/8/5RK1 b - - 1 1"
         );
+    }
+
+    #[test]
+    fn a_null_move_passes_the_turn() {
+        // Black has just played e7-e5, and the d5 pawn could take en passant.
+        // Passing gives that up.
+        let pos = Position::from_fen("4k3/8/8/3Pp3/8/8/8/4K3 w - e6 0 1").unwrap();
+        let passed = pos.make_null_move();
+        assert!(passed.is_consistent());
+        assert_eq!(passed.to_fen(), "4k3/8/8/3Pp3/8/8/8/4K3 b - - 0 1");
+        assert_eq!(passed.key(), passed.compute_key());
+        assert_ne!(passed.key(), pos.key());
+
+        // Passing back gives the same pieces with the same side to move.
+        let twice = passed.make_null_move();
+        assert_eq!(twice.to_fen(), "4k3/8/8/3Pp3/8/8/8/4K3 w - - 0 2");
+        assert_eq!(twice.key(), twice.compute_key());
+
+        // The halfmove clock starts again.
+        let late = Position::from_fen("4k3/8/8/8/8/8/8/4K2R w K - 37 60").unwrap();
+        assert_eq!(late.make_null_move().halfmove_clock(), 0);
     }
 
     #[test]
