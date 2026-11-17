@@ -11,15 +11,19 @@
 //! the position is quiet, so that no position is judged in the middle of an
 //! exchange. Iterative deepening searches to depth 1, 2, 3, ... in turn; each
 //! iteration tries the previous one's best line first, which makes cutoffs
-//! come early.
+//! come early. The transposition table remembers what was found about each
+//! position, across iterations and across searches.
 
 mod ordering;
 pub(crate) mod strength;
+mod tt;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use self::ordering::{OrderedMoves, tactical_score};
+pub use self::tt::TranspositionTable;
+use self::tt::{Bound, Entry};
 use crate::board::Position;
 use crate::eval::evaluate;
 use crate::movegen::legal_moves;
@@ -97,18 +101,23 @@ pub struct Outcome {
 ///
 /// `history` holds the keys of the earlier positions of the game since the
 /// last irreversible move, oldest first; repeating one of them is a draw.
-/// Setting `stop` ends the search early. Time limits and `stop` only take
-/// effect once the first iteration is complete, so a searched move is
-/// always available. `report` is called after every completed iteration.
+/// The search reads and fills `tt`; the same table should serve every search
+/// of a game, and be cleared for a new one. Setting `stop` ends the search
+/// early. Time limits and `stop` only take effect once the first iteration
+/// is complete, so a searched move is always available. `report` is called
+/// after every completed iteration.
 pub fn search(
     root: &Position,
     history: &[u64],
     limits: Limits,
+    tt: &TranspositionTable,
     stop: &AtomicBool,
     mut report: impl FnMut(&Report),
 ) -> Outcome {
     let start = Instant::now();
+    tt.new_search();
     let mut searcher = Searcher {
+        tt,
         nodes: 0,
         node_limit: limits.nodes.unwrap_or(u64::MAX),
         stop,
@@ -181,6 +190,7 @@ pub fn search(
 
 /// The state of one search.
 struct Searcher<'a> {
+    tt: &'a TranspositionTable,
     nodes: u64,
     node_limit: u64,
     stop: &'a AtomicBool,
@@ -248,6 +258,23 @@ impl Searcher<'_> {
             return evaluate(pos);
         }
 
+        // An earlier search of this position, at least as deep as this one,
+        // may already settle it. Not at the root, which must find a move.
+        let stored = self.tt.probe(pos.key(), ply);
+        if ply > 0
+            && let Some(entry) = stored
+            && entry.depth >= depth
+        {
+            let settled = match entry.bound {
+                Bound::Exact => true,
+                Bound::Lower => entry.score >= beta,
+                Bound::Upper => entry.score <= alpha,
+            };
+            if settled {
+                return entry.score;
+            }
+        }
+
         let moves = legal_moves(pos);
         if moves.is_empty() {
             return if pos.checkers().is_empty() {
@@ -266,16 +293,21 @@ impl Searcher<'_> {
         } else {
             None
         };
+        // The move to try first: the previous iteration's best line, or else
+        // the best move the table remembers.
+        let first_move = pv_move.or(stored.and_then(|entry| entry.mv));
         // With exact root scores every root move gets the full window, so no
         // move is merely shown to be worse than the best: each is scored.
         let exact = ply == 0 && self.exact_root;
         if exact {
             self.root_scores.clear();
         }
+        let original_alpha = alpha;
         let mut best = -INFINITY;
+        let mut best_move = None;
         let mut child_pv = MoveList::new();
         self.path.push(pos.key());
-        for mv in OrderedMoves::new(pos, moves, pv_move) {
+        for mv in OrderedMoves::new(pos, moves, first_move) {
             let (child_alpha, child_beta) = if exact {
                 (-INFINITY, INFINITY)
             } else {
@@ -300,6 +332,7 @@ impl Searcher<'_> {
                 best = score;
                 if score > alpha {
                     alpha = score;
+                    best_move = Some(mv);
                     pv.clear();
                     pv.push(mv);
                     for &reply in child_pv.iter() {
@@ -312,6 +345,24 @@ impl Searcher<'_> {
             }
         }
         self.path.pop();
+
+        // An interrupted search knows nothing for sure: store nothing.
+        if !self.stopped {
+            let bound = if best >= beta {
+                Bound::Lower
+            } else if best > original_alpha {
+                Bound::Exact
+            } else {
+                Bound::Upper
+            };
+            let entry = Entry {
+                mv: best_move,
+                score: best,
+                depth,
+                bound,
+            };
+            self.tt.store(pos.key(), entry, ply);
+        }
         best
     }
 
@@ -397,8 +448,19 @@ mod tests {
         }
     }
 
+    fn table() -> TranspositionTable {
+        TranspositionTable::new(1).unwrap()
+    }
+
     fn search_quietly(pos: &Position, history: &[u64], limits: Limits) -> Outcome {
-        search(pos, history, limits, &AtomicBool::new(false), |_| {})
+        search(
+            pos,
+            history,
+            limits,
+            &table(),
+            &AtomicBool::new(false),
+            |_| {},
+        )
     }
 
     fn run(fen: &str, plies: u32) -> Outcome {
@@ -499,7 +561,8 @@ mod tests {
     fn reports_every_iteration_with_a_legal_line() {
         let pos = Position::startpos();
         let mut depths = Vec::new();
-        let outcome = search(&pos, &[], depth(4), &AtomicBool::new(false), |report| {
+        let stop = AtomicBool::new(false);
+        let outcome = search(&pos, &[], depth(4), &table(), &stop, |report| {
             depths.push(report.depth);
             // Every move of the line must be legal in turn.
             let mut line_pos = pos;
@@ -526,7 +589,14 @@ mod tests {
     #[test]
     fn stop_flag_ends_the_search_after_the_first_iteration() {
         let stop = AtomicBool::new(true);
-        let outcome = search(&Position::startpos(), &[], Limits::default(), &stop, |_| {});
+        let outcome = search(
+            &Position::startpos(),
+            &[],
+            Limits::default(),
+            &table(),
+            &stop,
+            |_| {},
+        );
         assert_eq!(outcome.depth, 1);
         assert!(outcome.best_move.is_some());
     }
@@ -604,5 +674,31 @@ mod tests {
         assert_eq!(first.nodes, second.nodes);
         assert_eq!(first.best_move, second.best_move);
         assert_eq!(first.score, second.score);
+    }
+
+    #[test]
+    fn the_table_carries_over_between_searches() {
+        let kiwipete = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .unwrap();
+        let tt = table();
+        let stop = AtomicBool::new(false);
+        let first = search(&kiwipete, &[], depth(5), &tt, &stop, |_| {});
+        // The second search finds most of the work already done.
+        let second = search(&kiwipete, &[], depth(5), &tt, &stop, |_| {});
+        assert!(
+            second.nodes * 2 < first.nodes,
+            "{} then {}",
+            second.nodes,
+            first.nodes
+        );
+        assert!(legal_moves(&kiwipete).contains(&second.best_move.unwrap()));
+
+        // A cleared table is as good as a new one: same search, same count.
+        tt.clear();
+        let after_clear = search(&kiwipete, &[], depth(5), &tt, &stop, |_| {});
+        assert_eq!(after_clear.nodes, first.nodes);
+        assert_eq!(after_clear.best_move, first.best_move);
     }
 }

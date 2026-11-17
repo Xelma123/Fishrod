@@ -101,6 +101,16 @@ impl Move {
             _ => format!("{from}{to}"),
         }
     }
+
+    /// The move's 16 bits, for compact storage.
+    pub(crate) const fn to_bits(self) -> u16 {
+        self.0
+    }
+
+    /// The move whose `to_bits` gave `bits`.
+    pub(crate) const fn from_bits(bits: u16) -> Move {
+        Move(bits)
+    }
 }
 
 impl fmt::Debug for Move {

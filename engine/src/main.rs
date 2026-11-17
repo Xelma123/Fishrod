@@ -5,15 +5,16 @@
 use std::process::ExitCode;
 use std::time::Instant;
 
-use fishrod::bench;
 use fishrod::board::{CastlingSide, Position};
 use fishrod::movegen::{attacks, perft};
 use fishrod::types::{Color, Square};
+use fishrod::{bench, openings};
 
 const USAGE: &str = "\
 usage: fishrod                      UCI mode, for chess GUIs
        fishrod perft <depth> [<fen>]
-       fishrod bench [<depth>]";
+       fishrod bench [<depth>]
+       fishrod openings <count> [<seed>]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -21,6 +22,7 @@ fn main() -> ExitCode {
         None => fishrod::uci::run().map_err(|err| format!("I/O error: {err}")),
         Some("perft") => run_perft(&args[1..]),
         Some("bench") => run_bench(&args[1..]),
+        Some("openings") => run_openings(&args[1..]),
         Some(other) => Err(format!("unknown command '{other}'")),
     };
     match result {
@@ -59,6 +61,25 @@ fn run_bench(args: &[String]) -> Result<(), String> {
         summary.nodes,
         summary.nodes as f64 / seconds.max(1e-9)
     );
+    Ok(())
+}
+
+/// `openings <count> [<seed>]`: prints balanced opening positions, one EPD
+/// line each, for engine-versus-engine tests.
+fn run_openings(args: &[String]) -> Result<(), String> {
+    let count: usize = args
+        .first()
+        .ok_or("missing count")?
+        .parse()
+        .map_err(|_| "count must be a whole number")?;
+    let seed: u64 = match args.get(1) {
+        Some(text) => text.parse().map_err(|_| "seed must be a whole number")?,
+        None => openings::DEFAULT_SEED,
+    };
+    attacks::init();
+    for pos in openings::openings(seed, openings::DEFAULT_DEPTH).take(count) {
+        println!("{}", openings::to_epd(&pos));
+    }
     Ok(())
 }
 

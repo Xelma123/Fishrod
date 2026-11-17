@@ -7,12 +7,14 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use crate::board::Position;
-use crate::search::{Limits, Outcome, search};
+use crate::search::{Limits, Outcome, TranspositionTable, search};
 use crate::uci::parse_move;
 
 /// The depth `fishrod bench` uses when none is given: a few seconds in a
 /// release build. Raising it changes the bench count, as expected.
 pub const DEFAULT_DEPTH: u32 = 5;
+/// The size of the transposition table, in MiB: the engine's default.
+const HASH_MB: usize = 16;
 
 /// Positions given as FEN: the standard perft positions, the first Chess960
 /// perft positions (see `engine/tests/perft.rs` for their sources) and a few
@@ -99,17 +101,21 @@ pub struct Summary {
 }
 
 /// Searches every bench position to `depth`, each as a fresh search without
-/// game history, and calls `report` after each one.
+/// game history and with an empty transposition table, and calls `report`
+/// after each one.
 pub fn run(depth: u32, mut report: impl FnMut(usize, &Position, &Outcome)) -> Summary {
     let limits = Limits {
         depth: Some(depth),
         ..Limits::default()
     };
+    let tt = TranspositionTable::new(HASH_MB).expect("the bench hash table fits in memory");
     let never_stop = AtomicBool::new(false);
     let start = Instant::now();
     let mut nodes = 0;
     for (index, pos) in positions().iter().enumerate() {
-        let outcome = search(pos, &[], limits, &never_stop, |_| {});
+        // An empty table makes each count independent of the positions before.
+        tt.clear();
+        let outcome = search(pos, &[], limits, &tt, &never_stop, |_| {});
         nodes += outcome.nodes;
         report(index, pos, &outcome);
     }

@@ -1,12 +1,12 @@
 //! Move ordering. Alpha-beta cuts off sooner when the best move comes first,
-//! so moves are tried in order of promise: the previous iteration's best
-//! move, then captures and promotions, then quiet moves.
+//! so moves are tried in order of promise: the move an earlier search found
+//! best here, then captures and promotions, then quiet moves.
 
 use crate::board::Position;
 use crate::types::{Move, MoveKind, MoveList, PieceType};
 
-/// Ordering score of the move the previous iteration found best here.
-const PV_SCORE: i32 = 1_000_000;
+/// Ordering score of the move an earlier search found best here.
+const FIRST_MOVE_SCORE: i32 = 1_000_000;
 /// Base ordering score of captures and promotions.
 const TACTICAL_SCORE: i32 = 100_000;
 /// Rough piece values used only for ordering, pawn to king.
@@ -22,11 +22,14 @@ pub(super) struct OrderedMoves {
 }
 
 impl OrderedMoves {
-    pub(super) fn new(pos: &Position, moves: MoveList, pv_move: Option<Move>) -> OrderedMoves {
+    /// Orders `moves`, putting `first_move` first if it is among them. A
+    /// remembered move that is not legal here, after a hash collision, is
+    /// thereby ignored.
+    pub(super) fn new(pos: &Position, moves: MoveList, first_move: Option<Move>) -> OrderedMoves {
         let mut scores = [0; MoveList::CAPACITY];
         for (score, &mv) in scores.iter_mut().zip(moves.iter()) {
-            *score = if Some(mv) == pv_move {
-                PV_SCORE
+            *score = if Some(mv) == first_move {
+                FIRST_MOVE_SCORE
             } else {
                 tactical_score(pos, mv).unwrap_or(0)
             };

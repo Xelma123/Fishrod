@@ -21,10 +21,11 @@ use crate::eval::evaluate;
 use crate::movegen::legal_moves;
 use crate::rng::Rng;
 use crate::search::strength::Strength;
-use crate::search::{Limits, Report, mate_in, search};
+use crate::search::{Limits, Report, TranspositionTable, mate_in, search};
 use crate::types::{Color, Move, MoveKind};
 
-/// Largest accepted `Hash` value, in MiB.
+/// Default and largest `Hash`: the transposition table's size, in MiB.
+const HASH_DEFAULT: u64 = 16;
 const HASH_MAX: u64 = 65_536;
 /// Default and largest `Move Overhead`, in milliseconds: time kept in hand
 /// for the delay between the engine and the GUI's clock.
@@ -60,6 +61,9 @@ struct Uci<W> {
     elo: u32,
     /// `GameLog`: the file each move is recorded in, if any.
     game_log: Option<PathBuf>,
+    /// Kept from one search to the next for the whole game; shared with the
+    /// search thread.
+    tt: Arc<TranspositionTable>,
     /// Shared with the search thread, which prints its own lines.
     out: Arc<Mutex<W>>,
     /// The running or finished search that has not been waited for yet.
@@ -121,6 +125,10 @@ impl<W: Write + Send + 'static> Uci<W> {
             limit_strength: false,
             elo: Strength::DEFAULT_ELO,
             game_log: None,
+            tt: Arc::new(
+                TranspositionTable::new(HASH_DEFAULT as usize)
+                    .expect("the default hash table fits in memory"),
+            ),
             out: Arc::new(Mutex::new(out)),
             search: None,
         }
@@ -145,6 +153,7 @@ impl<W: Write + Send + 'static> Uci<W> {
                 self.stop_search();
                 self.position = Position::startpos();
                 self.history.clear();
+                self.tt.clear();
             }
             "position" => {
                 self.stop_search();
@@ -184,7 +193,7 @@ impl<W: Write + Send + 'static> Uci<W> {
         self.say(format_args!("id name {} {}", crate::NAME, crate::VERSION))?;
         self.say(format_args!("id author {}", crate::AUTHOR))?;
         self.say(format_args!(
-            "option name Hash type spin default 16 min 1 max {HASH_MAX}"
+            "option name Hash type spin default {HASH_DEFAULT} min 1 max {HASH_MAX}"
         ))?;
         self.say("option name Threads type spin default 1 min 1 max 1")?;
         self.say(format_args!(
@@ -227,6 +236,7 @@ impl<W: Write + Send + 'static> Uci<W> {
         let history = self.history.clone();
         let chess960 = self.chess960;
         let game_log = self.game_log.clone();
+        let tt = Arc::clone(&self.tt);
         let infinite = command.infinite;
         let unbounded = infinite
             || (limits.depth.is_none() && limits.nodes.is_none() && limits.hard_time.is_none());
@@ -234,8 +244,8 @@ impl<W: Write + Send + 'static> Uci<W> {
             // If the output is gone, so is the GUI: there is no one left to
             // tell, so write errors are ignored here.
             let start = Instant::now();
-            let outcome = search(&position, &history, limits, &thread_stop, |report| {
-                let _ = write_line(&out, info_line(report, chess960));
+            let outcome = search(&position, &history, limits, &tt, &thread_stop, |report| {
+                let _ = write_line(&out, info_line(report, tt.hashfull(), chess960));
             });
             let time = start.elapsed();
             let played = match strength {
@@ -359,9 +369,12 @@ impl<W: Write + Send + 'static> Uci<W> {
         let value = tokens.collect::<Vec<_>>().join(" ");
 
         match name.to_ascii_lowercase().as_str() {
-            // There is no transposition table yet: the value is checked, then unused.
+            // A new, empty table; the old one stays if the memory is not there.
             "hash" => {
-                parse_spin(&value, 1, HASH_MAX)?;
+                let megabytes = parse_spin(&value, 1, HASH_MAX)? as usize;
+                let table = TranspositionTable::new(megabytes)
+                    .map_err(|_| format!("cannot allocate {megabytes} MiB for the hash table"))?;
+                self.tt = Arc::new(table);
             }
             "threads" => {
                 parse_spin(&value, 1, 1)?;
@@ -503,14 +516,15 @@ fn clock_seed() -> u64 {
         .map_or(0, |since| since.as_nanos() as u64)
 }
 
-/// The `info` line for a completed iteration.
-fn info_line(report: &Report, chess960: bool) -> String {
+/// The `info` line for a completed iteration. `hashfull` is how full the
+/// transposition table is, in permille.
+fn info_line(report: &Report, hashfull: usize, chess960: bool) -> String {
     let millis = report.time.as_millis();
     let nps = u128::from(report.nodes) * 1000 / millis.max(1);
     let score = score_text(report.score);
     let pv: Vec<String> = report.pv.iter().map(|mv| mv.to_uci(chess960)).collect();
     format!(
-        "info depth {} score {score} nodes {} nps {nps} time {millis} pv {}",
+        "info depth {} score {score} nodes {} nps {nps} hashfull {hashfull} time {millis} pv {}",
         report.depth,
         report.nodes,
         pv.join(" ")
@@ -719,6 +733,8 @@ mod tests {
         );
         assert!(uci.chess960);
         assert_eq!(uci.move_overhead, 50);
+        // 64 MiB of 8-byte entries.
+        assert_eq!(uci.tt.capacity(), 64 << 17);
         assert_eq!(out, "");
 
         let (_, out) = session(
@@ -820,6 +836,24 @@ mod tests {
             (limits.depth, limits.nodes, limits.hard_time),
             (Some(7), Some(1000), None)
         );
+    }
+
+    #[test]
+    fn the_hash_table_lasts_until_a_new_game() {
+        let mut uci = Uci::new(Vec::new());
+        let start = Position::startpos().key();
+        uci.handle("position startpos").unwrap();
+        uci.handle("go depth 3").unwrap();
+        uci.wait_for_search();
+        assert!(output(&uci).contains(" hashfull "));
+        // The next search, a move later, still finds the first one's results.
+        uci.handle("position startpos moves e2e4").unwrap();
+        uci.handle("go depth 1").unwrap();
+        uci.wait_for_search();
+        assert!(uci.tt.probe(start, 0).is_some());
+
+        uci.handle("ucinewgame").unwrap();
+        assert!(uci.tt.probe(start, 0).is_none());
     }
 
     #[test]
