@@ -2,7 +2,7 @@
 
 Fishrod is a UCI chess engine written from scratch in Rust.
 
-**Status:** Early development. Phase 1 of 7 (board representation and move generation) is in progress, and the engine is not yet playable.
+**Status:** Early development. Phases 1 to 3 of 7 are complete: the engine plays full games over UCI, and every change that affects its strength is measured with an SPRT. Phase 4 (strong classical search) is next.
 
 ## Design
 
@@ -30,9 +30,8 @@ Fishrod communicates through the Universal Chess Interface (UCI) and is intended
 |---|---|
 | `fishrod` | Starts the engine in UCI mode. |
 | `fishrod perft <depth> [fen]` | Counts the leaf nodes of the move tree to the given depth and prints the count for each root move. |
-| `fishrod bench` | Searches a fixed set of positions to a fixed depth and prints the total node count and speed. |
-
-Each command becomes available when the corresponding phase of the roadmap is complete.
+| `fishrod bench [depth]` | Searches a fixed set of positions to a fixed depth and prints the total node count and speed. |
+| `fishrod openings <count> [seed]` | Prints balanced opening positions in EPD format, for engine-versus-engine tests. |
 
 ## Testing
 
