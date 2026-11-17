@@ -23,7 +23,7 @@ mod tt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use self::ordering::{OrderedMoves, tactical_score};
+use self::ordering::{History, Killers, OrderedMoves, add_killer, history_bonus, tactical_score};
 pub use self::tt::TranspositionTable;
 use self::tt::{Bound, Entry};
 use crate::board::Position;
@@ -43,6 +43,8 @@ const DRAW: i32 = 0;
 /// The clock and the stop flag are checked once per this many nodes: reading
 /// the clock costs more than searching a node.
 const CHECK_INTERVAL: u64 = 1024;
+/// No killer moves, for a fresh ply and for quiescence.
+const NO_KILLERS: Killers = [Move::NULL; 2];
 
 /// The number of moves to a forced mate, if `score` announces one: positive
 /// when the side to move mates, negative when it gets mated.
@@ -129,6 +131,8 @@ pub fn search(
         stopped: false,
         path: history.to_vec(),
         prev_pv: MoveList::new(),
+        killers: [NO_KILLERS; MAX_PLY],
+        quiet_history: History::new(),
         exact_root: limits.exact_root_scores,
         root_scores: Vec::new(),
     };
@@ -208,6 +212,10 @@ struct Searcher<'a> {
     path: Vec<u64>,
     /// The principal variation of the previous iteration, tried first.
     prev_pv: MoveList,
+    /// The killer moves of each ply, kept across iterations.
+    killers: [Killers; MAX_PLY],
+    /// The history scores of quiet moves, kept across iterations.
+    quiet_history: History,
     /// Whether root moves get a full window (`Limits::exact_root_scores`).
     exact_root: bool,
     /// Root moves and their scores in the current iteration, when `exact_root` is set.
@@ -314,8 +322,19 @@ impl Searcher<'_> {
         let mut best = -INFINITY;
         let mut best_move = None;
         let mut child_pv = MoveList::new();
+        // Quiet moves searched without a cutoff, to be penalized if a later
+        // move cuts off.
+        let mut quiets_tried = MoveList::new();
+        let ordered = OrderedMoves::new(
+            pos,
+            moves,
+            first_move,
+            &self.killers[ply],
+            &self.quiet_history,
+        );
         self.path.push(pos.key());
-        for (index, mv) in OrderedMoves::new(pos, moves, first_move).enumerate() {
+        for (index, mv) in ordered.enumerate() {
+            let is_quiet = tactical_score(pos, mv).is_none();
             let child = pos.make_move(mv);
             let on_line = Some(mv) == pv_move;
             let mut score;
@@ -383,9 +402,15 @@ impl Searcher<'_> {
                         pv.push(reply);
                     }
                     if alpha >= beta {
+                        if is_quiet {
+                            self.reward_cutoff(pos, mv, depth, ply, &quiets_tried);
+                        }
                         break;
                     }
                 }
+            }
+            if is_quiet {
+                quiets_tried.push(mv);
             }
         }
         self.path.pop();
@@ -408,6 +433,26 @@ impl Searcher<'_> {
             self.tt.store(pos.key(), entry, ply);
         }
         best
+    }
+
+    /// Learns from a quiet move that cut off at `ply`: it becomes a killer
+    /// move there, its history score rises, and the quiet moves tried before
+    /// it in vain lose history score.
+    fn reward_cutoff(
+        &mut self,
+        pos: &Position,
+        mv: Move,
+        depth: i32,
+        ply: usize,
+        tried_in_vain: &MoveList,
+    ) {
+        add_killer(&mut self.killers[ply], mv);
+        let side = pos.side_to_move();
+        let bonus = history_bonus(depth);
+        self.quiet_history.update(side, mv, bonus);
+        for &other in tried_in_vain.iter() {
+            self.quiet_history.update(side, other, -bonus);
+        }
     }
 
     /// Searches only captures and promotions (all moves when in check) until
@@ -442,7 +487,8 @@ impl Searcher<'_> {
             }
         }
 
-        for mv in OrderedMoves::new(pos, candidates, None) {
+        let ordered = OrderedMoves::new(pos, candidates, None, &NO_KILLERS, &self.quiet_history);
+        for mv in ordered {
             let score = -self.quiescence(&pos.make_move(mv), -beta, -alpha, ply + 1);
             if self.stopped {
                 break;
