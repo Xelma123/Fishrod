@@ -5,7 +5,9 @@
 //! reply's score is negated on the way back up. `alpha` is the score the side
 //! to move is already sure of and `beta` the most the opponent will allow. A
 //! move that scores `beta` or more refutes the opponent's previous move, so
-//! the remaining moves need not be searched: a cutoff.
+//! the remaining moves need not be searched: a cutoff. Principal variation
+//! search narrows the window to a single point for every move but the first:
+//! proving a move no better than the best so far is cheaper than scoring it.
 //!
 //! When the depth runs out, a quiescence search keeps playing captures until
 //! the position is quiet, so that no position is judged in the middle of an
@@ -258,10 +260,16 @@ impl Searcher<'_> {
             return evaluate(pos);
         }
 
+        // A node searched with a window wider than one point can still
+        // change the principal variation: a PV node. Every other node only
+        // has to show that it fails high or low.
+        let pv_node = beta - alpha > 1;
+
         // An earlier search of this position, at least as deep as this one,
-        // may already settle it. Not at the root, which must find a move.
+        // may already settle it. PV nodes, the root among them, are searched
+        // anyway, so that the principal variation stays whole and exact.
         let stored = self.tt.probe(pos.key(), ply);
-        if ply > 0
+        if !pv_node
             && let Some(entry) = stored
             && entry.depth >= depth
         {
@@ -307,21 +315,57 @@ impl Searcher<'_> {
         let mut best_move = None;
         let mut child_pv = MoveList::new();
         self.path.push(pos.key());
-        for mv in OrderedMoves::new(pos, moves, first_move) {
-            let (child_alpha, child_beta) = if exact {
-                (-INFINITY, INFINITY)
+        for (index, mv) in OrderedMoves::new(pos, moves, first_move).enumerate() {
+            let child = pos.make_move(mv);
+            let on_line = Some(mv) == pv_move;
+            let mut score;
+            if exact {
+                score = -self.negamax(
+                    &child,
+                    depth - 1,
+                    -INFINITY,
+                    INFINITY,
+                    ply + 1,
+                    on_line,
+                    &mut child_pv,
+                );
+            } else if index == 0 {
+                score = -self.negamax(
+                    &child,
+                    depth - 1,
+                    -beta,
+                    -alpha,
+                    ply + 1,
+                    on_line,
+                    &mut child_pv,
+                );
             } else {
-                (-beta, -alpha)
-            };
-            let score = -self.negamax(
-                &pos.make_move(mv),
-                depth - 1,
-                child_alpha,
-                child_beta,
-                ply + 1,
-                Some(mv) == pv_move,
-                &mut child_pv,
-            );
+                // Principal variation search: the first move is most likely
+                // the best, so a later move only has to be shown no better
+                // than alpha, which a null window around alpha does quickly.
+                // A move that does better is searched again with the full
+                // window, for its exact score and line.
+                score = -self.negamax(
+                    &child,
+                    depth - 1,
+                    -alpha - 1,
+                    -alpha,
+                    ply + 1,
+                    on_line,
+                    &mut child_pv,
+                );
+                if score > alpha && score < beta && !self.stopped {
+                    score = -self.negamax(
+                        &child,
+                        depth - 1,
+                        -beta,
+                        -alpha,
+                        ply + 1,
+                        on_line,
+                        &mut child_pv,
+                    );
+                }
+            }
             if self.stopped {
                 break;
             }
@@ -700,5 +744,20 @@ mod tests {
         let after_clear = search(&kiwipete, &[], depth(5), &tt, &stop, |_| {});
         assert_eq!(after_clear.nodes, first.nodes);
         assert_eq!(after_clear.best_move, first.best_move);
+    }
+
+    #[test]
+    fn the_principal_variation_stays_whole_with_a_full_table() {
+        // The second search finds every position of the line already in the
+        // table, deep enough; PV nodes must still be searched, not cut short.
+        let pos = Position::startpos();
+        let tt = table();
+        let stop = AtomicBool::new(false);
+        search(&pos, &[], depth(6), &tt, &stop, |_| {});
+        let mut lengths = Vec::new();
+        search(&pos, &[], depth(6), &tt, &stop, |report| {
+            lengths.push(report.pv.len());
+        });
+        assert_eq!(lengths, [1, 2, 3, 4, 5, 6]);
     }
 }
