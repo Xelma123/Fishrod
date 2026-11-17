@@ -22,6 +22,7 @@
 
 mod ordering;
 mod reductions;
+mod see;
 pub(crate) mod strength;
 mod tt;
 
@@ -30,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use self::ordering::{History, Killers, OrderedMoves, add_killer, history_bonus, tactical_score};
 use self::reductions::reduction as reduction_for;
+use self::see::loses_no_material;
 pub use self::tt::TranspositionTable;
 use self::tt::{Bound, Entry};
 use crate::board::Position;
@@ -59,6 +61,27 @@ const LMR_MIN_DEPTH: i32 = 3;
 /// exceeds beta by this margin per ply left, in centipawns.
 const RFP_MAX_DEPTH: i32 = 6;
 const RFP_MARGIN: i32 = 80;
+/// Late move pruning applies up to this depth; see `lmp_move_count`.
+const LMP_MAX_DEPTH: i32 = 4;
+/// Futility pruning applies up to this depth, when the evaluation plus
+/// `FUTILITY_BASE + FUTILITY_MARGIN * depth` centipawns stays at or below alpha.
+const FUTILITY_MAX_DEPTH: i32 = 6;
+const FUTILITY_BASE: i32 = 100;
+const FUTILITY_MARGIN: i32 = 100;
+/// Scores beyond this announce a forced mate.
+pub(crate) const MATE_BOUND: i32 = MATE - MAX_PLY as i32;
+/// Aspiration windows start at this depth, this many centipawns either side
+/// of the previous iteration's score.
+const ASPIRATION_MIN_DEPTH: u32 = 4;
+const ASPIRATION_DELTA: i32 = 25;
+/// Internal iterative reduction applies from this depth.
+const IIR_MIN_DEPTH: i32 = 4;
+
+/// How many moves a node at `depth` searches before late move pruning
+/// skips its remaining quiet moves.
+const fn lmp_move_count(depth: i32) -> usize {
+    (3 + depth * depth) as usize
+}
 
 /// The number of moves to a forced mate, if `score` announces one: positive
 /// when the side to move mates, negative when it gets mated.
@@ -174,7 +197,34 @@ pub fn search(
         .clamp(1, MAX_PLY as u32 - 1);
     let mut pv = MoveList::new();
     for depth in 1..=max_depth {
-        let score = searcher.negamax(root, depth as i32, -INFINITY, INFINITY, 0, true, &mut pv);
+        // Aspiration windows: the score rarely moves far from one iteration
+        // to the next, so the search starts with a narrow window around the
+        // previous score, which cuts off more. A score outside the window is
+        // only a bound: the window widens on that side and the search
+        // repeats. Not with exact root scores, nor around a mate score.
+        let mut delta = ASPIRATION_DELTA;
+        let aspirate = depth >= ASPIRATION_MIN_DEPTH
+            && !limits.exact_root_scores
+            && mate_in(outcome.score).is_none();
+        let (mut alpha, mut beta) = if aspirate {
+            (outcome.score - delta, outcome.score + delta)
+        } else {
+            (-INFINITY, INFINITY)
+        };
+        let score = loop {
+            let score = searcher.negamax(root, depth as i32, alpha, beta, 0, true, &mut pv);
+            if searcher.stopped {
+                break score;
+            }
+            if score <= alpha {
+                alpha = (score - delta).max(-INFINITY);
+            } else if score >= beta {
+                beta = (score + delta).min(INFINITY);
+            } else {
+                break score;
+            }
+            delta *= 2;
+        };
         // An interrupted iteration may have missed better moves: drop it.
         if searcher.stopped {
             break;
@@ -387,6 +437,14 @@ impl Searcher<'_> {
         // The move to try first: the previous iteration's best line, or else
         // the best move the table remembers.
         let first_move = pv_move.or(stored.and_then(|entry| entry.mv));
+        // Internal iterative reduction: with no move from an earlier search
+        // to try first, the ordering is only a guess, so the node is searched
+        // a ply shallower. A later visit finds the move this search stores.
+        let depth = if depth >= IIR_MIN_DEPTH && first_move.is_none() {
+            depth - 1
+        } else {
+            depth
+        };
         // With exact root scores every root move gets the full window, so no
         // move is merely shown to be worse than the best: each is scored.
         let exact = ply == 0 && self.exact_root;
@@ -410,12 +468,37 @@ impl Searcher<'_> {
         for (index, mv) in ordered.enumerate() {
             let is_quiet = tactical_score(pos, mv).is_none();
             let child = pos.make_move(mv);
+            let gives_check = !child.checkers().is_empty();
             let on_line = Some(mv) == pv_move;
+            // Check extension: a move that gives check is searched a ply
+            // deeper, so that forcing lines are seen to their end.
+            let new_depth = depth - 1 + i32::from(gives_check);
+
+            // Shallow pruning of quiet moves, outside PV nodes and check,
+            // once a move has been searched and the node is not already lost
+            // to a mate. Late move pruning: near the leaves, the quiet moves
+            // at the back of the list are skipped. Futility pruning: when the
+            // evaluation is so far below alpha that a quiet move cannot be
+            // expected to close the gap, it is skipped.
+            if let Some(eval) = static_eval
+                && index > 0
+                && is_quiet
+                && !gives_check
+                && best > -MATE_BOUND
+            {
+                let late = depth <= LMP_MAX_DEPTH && index >= lmp_move_count(depth);
+                let futile = depth <= FUTILITY_MAX_DEPTH
+                    && eval + FUTILITY_BASE + FUTILITY_MARGIN * depth <= alpha;
+                if late || futile {
+                    continue;
+                }
+            }
+
             let mut score;
             if exact {
                 score = -self.negamax(
                     &child,
-                    depth - 1,
+                    new_depth,
                     -INFINITY,
                     INFINITY,
                     ply + 1,
@@ -425,7 +508,7 @@ impl Searcher<'_> {
             } else if index == 0 {
                 score = -self.negamax(
                     &child,
-                    depth - 1,
+                    new_depth,
                     -beta,
                     -alpha,
                     ply + 1,
@@ -437,7 +520,7 @@ impl Searcher<'_> {
                 // is unlikely to be best, so it is first searched shallower.
                 // Never for a move that gives check or escapes one.
                 let mut reduction = 0;
-                if depth >= LMR_MIN_DEPTH && is_quiet && !in_check && child.checkers().is_empty() {
+                if depth >= LMR_MIN_DEPTH && is_quiet && !in_check && !gives_check {
                     reduction = reduction_for(depth, index) - i32::from(pv_node);
                     reduction = reduction.clamp(0, depth - 2);
                 }
@@ -446,7 +529,7 @@ impl Searcher<'_> {
                 // than alpha, which a null window around alpha does quickly.
                 score = -self.negamax(
                     &child,
-                    depth - 1 - reduction,
+                    new_depth - reduction,
                     -alpha - 1,
                     -alpha,
                     ply + 1,
@@ -457,7 +540,7 @@ impl Searcher<'_> {
                 if reduction > 0 && score > alpha && !self.stopped {
                     score = -self.negamax(
                         &child,
-                        depth - 1,
+                        new_depth,
                         -alpha - 1,
                         -alpha,
                         ply + 1,
@@ -471,7 +554,7 @@ impl Searcher<'_> {
                 if score > alpha && score < beta && !self.stopped {
                     score = -self.negamax(
                         &child,
-                        depth - 1,
+                        new_depth,
                         -beta,
                         -alpha,
                         ply + 1,
@@ -575,9 +658,11 @@ impl Searcher<'_> {
         if moves.is_empty() {
             return if in_check { -MATE + ply as i32 } else { DRAW };
         }
+        // Captures that lose material once the opponent takes back cannot
+        // raise the score above standing pat, so they are not searched.
         let mut candidates = MoveList::new();
         for &mv in moves.iter() {
-            if in_check || tactical_score(pos, mv).is_some() {
+            if in_check || (tactical_score(pos, mv).is_some() && loses_no_material(pos, mv)) {
                 candidates.push(mv);
             }
         }
@@ -898,6 +983,20 @@ mod tests {
         let after_clear = search(&kiwipete, &[], depth(5), &tt, &stop, |_| {});
         assert_eq!(after_clear.nodes, first.nodes);
         assert_eq!(after_clear.best_move, first.best_move);
+    }
+
+    #[test]
+    fn a_fixed_move_time_is_used_in_full() {
+        // With equal soft and hard limits (`go movetime`), the search thinks
+        // until the limit.
+        let limits = Limits {
+            soft_time: Some(Duration::from_millis(150)),
+            hard_time: Some(Duration::from_millis(150)),
+            ..Limits::default()
+        };
+        let start = Instant::now();
+        search_quietly(&Position::startpos(), &[], limits);
+        assert!(start.elapsed() >= Duration::from_millis(140));
     }
 
     #[test]

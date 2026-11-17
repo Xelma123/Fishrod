@@ -1,7 +1,8 @@
 //! Move ordering. Alpha-beta cuts off sooner when the best move comes first,
 //! so moves are tried in order of promise: the move an earlier search found
-//! best here, then captures and promotions, then the killer moves, then the
-//! other quiet moves by their history.
+//! best here, then the captures and promotions that lose no material, then
+//! the killer moves, then the other quiet moves by their history, and last
+//! the captures that lose material once the opponent takes back.
 //!
 //! Killers and history are learned during the search. A quiet move that
 //! refuted the opponent's move in one position often refutes it in the
@@ -10,6 +11,7 @@
 //! squares, raised whenever the move causes a cutoff and lowered whenever it
 //! is tried in vain before another move does.
 
+use super::see::loses_no_material;
 use crate::board::Position;
 use crate::types::{Color, Move, MoveKind, MoveList, PieceType};
 
@@ -17,6 +19,9 @@ use crate::types::{Color, Move, MoveKind, MoveList, PieceType};
 const FIRST_MOVE_SCORE: i32 = 1_000_000;
 /// Base ordering score of captures and promotions.
 const TACTICAL_SCORE: i32 = 100_000;
+/// Base ordering score of captures and promotions that lose material: below
+/// every quiet move.
+const LOSING_TACTICAL_SCORE: i32 = -100_000;
 /// Ordering score of the second killer move; the first scores one more.
 const KILLER_SCORE: i32 = 50_000;
 /// Rough piece values used only for ordering, pawn to king.
@@ -95,7 +100,11 @@ impl OrderedMoves {
             *score = if Some(mv) == first_move {
                 FIRST_MOVE_SCORE
             } else if let Some(tactical) = tactical_score(pos, mv) {
-                tactical
+                if loses_no_material(pos, mv) {
+                    tactical
+                } else {
+                    tactical - TACTICAL_SCORE + LOSING_TACTICAL_SCORE
+                }
             } else if mv == killers[0] {
                 KILLER_SCORE + 1
             } else if mv == killers[1] {
@@ -208,6 +217,21 @@ mod tests {
         add_killer(&mut killers, b);
         add_killer(&mut killers, c);
         assert_eq!(killers, [c, b]);
+    }
+
+    #[test]
+    fn captures_that_lose_material_come_last() {
+        // Qxd6 loses the queen to cxd6: every quiet move comes before it.
+        let pos = Position::from_fen("4k3/2p5/3p4/8/8/8/8/3QK3 w - - 0 1").unwrap();
+        let order: Vec<Move> = OrderedMoves::new(
+            &pos,
+            legal_moves(&pos),
+            None,
+            &[Move::NULL; 2],
+            &History::new(),
+        )
+        .collect();
+        assert_eq!(order.last(), Some(&quiet(Square::D1, Square::D6)));
     }
 
     #[test]

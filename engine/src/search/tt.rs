@@ -18,7 +18,7 @@ use std::collections::TryReserveError;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-use super::{MATE, MAX_PLY};
+use super::MATE_BOUND;
 use crate::types::Move;
 
 /// How a stored score relates to the true score of its position.
@@ -47,8 +47,6 @@ pub(crate) struct Entry {
 const BUCKET_SIZE: usize = 4;
 /// Ages count searches modulo this; an entry stores the age of its search.
 const AGE_CYCLE: u8 = 64;
-/// Scores at least this far from zero announce a forced mate.
-const MATE_BOUND: i32 = MATE - MAX_PLY as i32;
 const MIB: usize = 1 << 20;
 
 /// Four entries side by side, aligned so that a bucket never straddles two
@@ -269,6 +267,7 @@ fn score_from_table(score: i32, ply: usize) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::MATE;
     use crate::types::{MoveKind, PieceType, Square};
 
     fn table() -> TranspositionTable {
