@@ -13,9 +13,9 @@ function check(name, answer, ok) {
 }
 
 const start = engine.command("state");
-check("start", start, start.includes("turn w") && start.endsWith("status ongoing"));
+check("start", start, start.includes("turn w") && start.includes("status ongoing"));
 const mate = engine.command("state f2f3 e7e5 g2g4 d8h4");
-check("checkmate", mate, mate.endsWith("status checkmate"));
+check("checkmate", mate, mate.includes("status checkmate") && mate.endsWith("san f3 e5 g4 Qh4#"));
 const illegal = engine.command("state e2e5");
 check("illegal move", illegal, illegal.startsWith("error "));
 

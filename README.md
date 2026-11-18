@@ -33,6 +33,20 @@ Fishrod communicates through the Universal Chess Interface (UCI) and is intended
 | `fishrod bench [depth]` | Searches a fixed set of positions to a fixed depth and prints the total node count and speed. |
 | `fishrod openings <count> [seed]` | Prints balanced opening positions in EPD format, for engine-versus-engine tests. |
 
+Against people, Fishrod keeps a brisk pace by default: under a clock a move takes about four seconds, less when the choice is easy and up to twice as long when the position turns difficult (`Think Time`, in milliseconds). It also varies its first moves among nearly equal ones, so that games do not all open alike (`Variety`, in centipawns). Set both options to 0 for engine-versus-engine matches and long games.
+
+## Web version
+
+The `web` directory holds a version of Fishrod that runs entirely in the browser: the engine compiled to WebAssembly, with a board to play against it.
+
+```sh
+rustup target add wasm32-wasip1
+tools/build-web.sh
+python -m http.server 8000 --directory web/www
+```
+
+Then open <http://localhost:8000>.
+
 ## Testing
 
 - **Perft:** move generation is checked against published node counts for standard and Chess960 test positions.
@@ -52,3 +66,5 @@ Fishrod communicates through the Universal Chess Interface (UCI) and is intended
 ## License
 
 Fishrod is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE).
+
+The chess piece images of the web version are by Colin M.L. Burnett, from Wikimedia Commons, and are available under the GPL, BSD and GFDL licenses.

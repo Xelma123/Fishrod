@@ -9,6 +9,7 @@ pub mod bench;
 pub mod board;
 pub mod eval;
 pub mod movegen;
+pub mod notation;
 pub mod openings;
 pub mod play;
 pub mod search;

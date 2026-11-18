@@ -10,10 +10,10 @@
 //! Commands; moves are in UCI notation and played from the starting position:
 //!
 //! - `state <moves>`: the position after the moves. Answer, one per line:
-//!   `fen <fen>`, `turn w|b`, `check 0|1`, `legal <moves>` and `status <s>`,
-//!   where `<s>` is `ongoing`, `checkmate`, `stalemate`, `fifty` (the
-//!   fifty-move rule), `repetition` (threefold) or `material` (neither side
-//!   can mate).
+//!   `fen <fen>`, `turn w|b`, `check 0|1`, `legal <moves>`, `status <s>` and
+//!   `san <moves>`, the moves played in standard algebraic notation. `<s>` is
+//!   `ongoing`, `checkmate`, `stalemate`, `fifty` (the fifty-move rule),
+//!   `repetition` (threefold) or `material` (neither side can mate).
 //! - `play <think ms> <variety cp> <elo, 0 for full strength> <seed> <moves>`:
 //!   the engine's move in that position, as against people in the UCI
 //!   version (see `fishrod::play`). Answer: `bestmove <move> score <cp n |
@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 use fishrod::bench;
 use fishrod::board::Position;
 use fishrod::movegen::legal_moves;
+use fishrod::notation::san;
 use fishrod::play::{Style, think_limits};
 use fishrod::search::{TranspositionTable, insufficient_material, mate_in, search};
 use fishrod::types::Color;
@@ -125,6 +126,8 @@ struct Game {
     /// Keys of the positions since the last capture or pawn move, oldest
     /// first: only these can repeat.
     history: Vec<u64>,
+    /// The moves played, in standard algebraic notation.
+    san: Vec<String>,
 }
 
 impl Game {
@@ -133,10 +136,12 @@ impl Game {
         let mut game = Game {
             position: Position::startpos(),
             history: Vec::new(),
+            san: Vec::new(),
         };
         for text in moves {
             let mv = parse_move(&game.position, text, false)
                 .ok_or_else(|| format!("illegal or unknown move '{text}'"))?;
+            game.san.push(san(&game.position, mv));
             game.history.push(game.position.key());
             game.position = game.position.make_move(mv);
             if game.position.halfmove_clock() == 0 {
@@ -156,10 +161,11 @@ impl Game {
         };
         let check = u8::from(!pos.checkers().is_empty());
         format!(
-            "fen {}\nturn {turn}\ncheck {check}\nlegal {}\nstatus {}",
+            "fen {}\nturn {turn}\ncheck {check}\nlegal {}\nstatus {}\nsan {}",
             pos.to_fen(),
             moves.join(" "),
-            self.status()
+            self.status(),
+            self.san.join(" ")
         )
     }
 
@@ -222,18 +228,18 @@ mod tests {
     fn states_describe_the_game() {
         let start = run("state").unwrap();
         assert!(start.contains("\nturn w\n"));
-        assert!(start.ends_with("\nstatus ongoing"));
+        assert!(start.ends_with("\nstatus ongoing\nsan "));
         assert_eq!(start.lines().nth(3).unwrap().split(' ').count(), 21);
 
         // Fool's mate.
         let mate = run("state f2f3 e7e5 g2g4 d8h4").unwrap();
         assert!(
-            mate.contains("\ncheck 1\nlegal \nstatus checkmate"),
+            mate.ends_with("\ncheck 1\nlegal \nstatus checkmate\nsan f3 e5 g4 Qh4#"),
             "{mate}"
         );
         // Knights out and back twice: the starting position a third time.
         let repeated = run("state g1f3 g8f6 f3g1 f6g8 g1f3 g8f6 f3g1 f6g8").unwrap();
-        assert!(repeated.ends_with("status repetition"), "{repeated}");
+        assert!(repeated.contains("status repetition"), "{repeated}");
 
         assert_eq!(
             run("state e2e5").unwrap_err(),
