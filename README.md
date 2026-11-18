@@ -37,7 +37,7 @@ Against people, Fishrod keeps a brisk pace by default: under a clock a move take
 
 ## Web version
 
-The `web` directory holds a version of Fishrod that runs entirely in the browser: the engine compiled to WebAssembly, with a board to play against it.
+The `web` directory holds a version of Fishrod that runs entirely in the browser: the engine compiled to WebAssembly, with a board to play against it. It is published at <https://xelma123.github.io/Fishrod/>.
 
 ```sh
 rustup target add wasm32-wasip1

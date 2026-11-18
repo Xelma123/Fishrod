@@ -19,6 +19,7 @@
 
 # Claude Code kişisel ayarları
 .claude/settings.local.json
+.claude/launch.json
 
 # Defter ve işletim sistemi artıkları
 .ipynb_checkpoints/
