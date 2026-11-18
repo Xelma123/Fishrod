@@ -36,7 +36,7 @@ pub use self::tt::TranspositionTable;
 use self::tt::{Bound, Entry};
 use crate::board::Position;
 use crate::eval::evaluate;
-use crate::movegen::legal_moves;
+use crate::movegen::{has_legal_move, legal_captures, legal_moves};
 use crate::types::{Move, MoveList, PieceType};
 
 /// The score of delivering mate right now. Mate in `n` plies scores
@@ -381,17 +381,12 @@ impl Searcher<'_> {
             }
         }
 
+        // The moves are generated only after the pruning below, which often
+        // makes them unnecessary. Out of check that changes nothing: a
+        // position without moves is a stalemate, a draw like the fifty-move
+        // rule. In check, mate comes first, so the rule waits for the moves.
         let in_check = !pos.checkers().is_empty();
-        let moves = legal_moves(pos);
-        if moves.is_empty() {
-            return if in_check {
-                -MATE + ply as i32
-            } else {
-                DRAW // stalemate
-            };
-        }
-        // Checked after mate: a mate on the hundredth half-move still counts.
-        if ply > 0 && pos.halfmove_clock() >= 100 {
+        if !in_check && ply > 0 && pos.halfmove_clock() >= 100 {
             return DRAW;
         }
 
@@ -409,7 +404,7 @@ impl Searcher<'_> {
             && mate_in(beta).is_none()
             && eval - RFP_MARGIN * depth >= beta
         {
-            return eval;
+            return if has_legal_move(pos) { eval } else { DRAW };
         }
 
         // Null move pruning: let the opponent move twice in a row. If a
@@ -424,6 +419,9 @@ impl Searcher<'_> {
             && self.null_child_ply != Some(ply)
             && has_pieces(pos)
         {
+            if !has_legal_move(pos) {
+                return DRAW; // stalemate
+            }
             let reduction = 3 + depth / 4;
             let saved = self.null_child_ply.replace(ply + 1);
             self.path.push(pos.key());
@@ -449,6 +447,19 @@ impl Searcher<'_> {
                     score
                 };
             }
+        }
+
+        let moves = legal_moves(pos);
+        if moves.is_empty() {
+            return if in_check {
+                -MATE + ply as i32
+            } else {
+                DRAW // stalemate
+            };
+        }
+        // Checked after mate: a mate on the hundredth half-move still counts.
+        if ply > 0 && pos.halfmove_clock() >= 100 {
+            return DRAW;
         }
 
         let pv_move = if on_pv {
@@ -676,20 +687,29 @@ impl Searcher<'_> {
             alpha = alpha.max(best);
         }
 
-        let moves = legal_moves(pos);
-        if moves.is_empty() {
-            return if in_check { -MATE + ply as i32 } else { DRAW };
-        }
-        // Captures that lose material once the opponent takes back cannot
-        // raise the score above standing pat, so they are not searched.
-        let mut candidates = MoveList::new();
-        for &mv in moves.iter() {
-            if in_check || (tactical_score(pos, mv).is_some() && loses_no_material(pos, mv)) {
-                candidates.push(mv);
+        // In check every escape is searched; otherwise only the captures and
+        // promotions, generated without the quiet moves. Those that lose
+        // material once the opponent takes back cannot raise the score above
+        // standing pat, so they are not searched.
+        let ordered = if in_check {
+            let moves = legal_moves(pos);
+            if moves.is_empty() {
+                return -MATE + ply as i32;
             }
-        }
-
-        let ordered = OrderedMoves::new(pos, candidates, None, &NO_KILLERS, &self.quiet_history);
+            OrderedMoves::new(pos, moves, None, &NO_KILLERS, &self.quiet_history)
+        } else {
+            let captures = legal_captures(pos);
+            if captures.is_empty() && !has_legal_move(pos) {
+                return DRAW; // stalemate
+            }
+            let mut candidates = MoveList::new();
+            for &mv in captures.iter() {
+                if loses_no_material(pos, mv) {
+                    candidates.push(mv);
+                }
+            }
+            OrderedMoves::safe_captures(pos, candidates)
+        };
         for mv in ordered {
             let score = -self.quiescence(&pos.make_move(mv), -beta, -alpha, ply + 1);
             if self.stopped {

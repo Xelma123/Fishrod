@@ -13,7 +13,8 @@
 #   new-engine    the build under test
 #   elo0, elo1    SPRT bounds, 0 and 10 by default
 #
-# The reported Elo is from the new build's point of view. Settings can be
+# The reported Elo is from the new build's point of view. Think Time is
+# turned off, so that both builds use their clocks in full. Settings can be
 # changed through environment variables:
 #
 #   TC            time control (default 8+0.08)
@@ -69,7 +70,7 @@ rm -f "$pgn"
 "$fastchess" \
     -engine cmd="$(engine_path "$new")" name=new \
     -engine cmd="$(engine_path "$base")" name=base \
-    -each tc="$tc" option.Hash=16 option.Threads=1 \
+    -each tc="$tc" option.Hash=16 option.Threads=1 "option.Think Time=0" \
     -openings file="$book" format=epd order=random \
     -rounds "$rounds" -games 2 -repeat -concurrency "$concurrency" \
     -sprt elo0="$elo0" elo1="$elo1" alpha=0.05 beta=0.05 \

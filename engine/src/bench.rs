@@ -110,19 +110,20 @@ pub fn run(depth: u32, mut report: impl FnMut(usize, &Position, &Outcome)) -> Su
     };
     let tt = TranspositionTable::new(HASH_MB).expect("the bench hash table fits in memory");
     let never_stop = AtomicBool::new(false);
-    let start = Instant::now();
     let mut nodes = 0;
+    // Only the searches are timed, not the clearing of the table between
+    // them, so that the speed measured is the search's own.
+    let mut time = Duration::ZERO;
     for (index, pos) in positions().iter().enumerate() {
         // An empty table makes each count independent of the positions before.
         tt.clear();
+        let start = Instant::now();
         let outcome = search(pos, &[], limits, &tt, &never_stop, |_| {});
+        time += start.elapsed();
         nodes += outcome.nodes;
         report(index, pos, &outcome);
     }
-    Summary {
-        nodes,
-        time: start.elapsed(),
-    }
+    Summary { nodes, time }
 }
 
 #[cfg(test)]

@@ -5,4 +5,4 @@ mod legal;
 mod magic;
 pub mod perft;
 
-pub use legal::legal_moves;
+pub use legal::{has_legal_move, legal_captures, legal_moves};

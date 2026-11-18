@@ -31,7 +31,9 @@ const HASH_MAX: u64 = 65_536;
 /// for the delay between the engine and the GUI's clock.
 const MOVE_OVERHEAD_DEFAULT: u64 = 10;
 const MOVE_OVERHEAD_MAX: u64 = 5_000;
-/// Largest `Think Time`, in milliseconds; 0 turns it off.
+/// Default and largest `Think Time`, in milliseconds; 0 turns it off. On by
+/// default, for brisk games against people.
+const THINK_TIME_DEFAULT: u64 = 4_000;
 const THINK_TIME_MAX: u64 = 60_000;
 /// Moves assumed to remain until the next time control when the GUI does
 /// not say (`movestogo`).
@@ -127,7 +129,7 @@ impl<W: Write + Send + 'static> Uci<W> {
             history: Vec::new(),
             chess960: false,
             move_overhead: MOVE_OVERHEAD_DEFAULT,
-            think_time: 0,
+            think_time: THINK_TIME_DEFAULT,
             limit_strength: false,
             elo: Strength::DEFAULT_ELO,
             game_log: None,
@@ -206,7 +208,7 @@ impl<W: Write + Send + 'static> Uci<W> {
             "option name Move Overhead type spin default {MOVE_OVERHEAD_DEFAULT} min 0 max {MOVE_OVERHEAD_MAX}"
         ))?;
         self.say(format_args!(
-            "option name Think Time type spin default 0 min 0 max {THINK_TIME_MAX}"
+            "option name Think Time type spin default {THINK_TIME_DEFAULT} min 0 max {THINK_TIME_MAX}"
         ))?;
         self.say("option name UCI_Chess960 type check default false")?;
         self.say("option name UCI_LimitStrength type check default false")?;
@@ -228,10 +230,11 @@ impl<W: Write + Send + 'static> Uci<W> {
             Ok(command) => command,
             Err(err) => return self.say(format_args!("info string {err}")),
         };
-        let mut limits = command.limits(self.position.side_to_move(), self.move_overhead);
-        if self.think_time > 0 {
-            limits = with_think_time(limits, Duration::from_millis(self.think_time));
-        }
+        let mut limits = command.limits(
+            self.position.side_to_move(),
+            self.move_overhead,
+            self.think_time,
+        );
         let strength = self.limit_strength.then(|| Strength::new(self.elo));
         if let Some(strength) = strength {
             let depth = limits
@@ -448,8 +451,10 @@ impl GoCommand {
     }
 
     /// The search limits for side `us`, keeping `overhead` milliseconds in
-    /// hand. Without any limit (a bare `go`) the search runs until `stop`.
-    fn limits(&self, us: Color, overhead: u64) -> Limits {
+    /// hand. Under a clock, `think` milliseconds (`Think Time`, 0 for none)
+    /// shorten the time spent per move; a fixed move time is used as given.
+    /// Without any limit (a bare `go`) the search runs until `stop`.
+    fn limits(&self, us: Color, overhead: u64, think: u64) -> Limits {
         let mut limits = Limits {
             depth: self.depth,
             nodes: self.nodes,
@@ -476,30 +481,23 @@ impl GoCommand {
             let soft = (target / 2).min(hard);
             limits.soft_time = Some(millis(soft));
             limits.hard_time = Some(millis(hard));
+            if think > 0 {
+                limits = with_think_time(limits, millis(think));
+            }
         }
         limits
     }
 }
 
-/// Shortens time-limited `limits` to `Think Time`: a move normally takes at
+/// Shortens the clock's `limits` to `Think Time`: a move normally takes at
 /// most `think`, and up to twice that when the search finds itself in
-/// trouble. The clock's own limits still apply when they are shorter.
-///
-/// Under a clock, no new iteration starts after three quarters of `think`,
-/// since it would rarely finish in time. A fixed move time (`go movetime`)
-/// is only capped. Searches without a time limit are left alone.
+/// trouble. The clock's own limits still apply when they are shorter. No
+/// new iteration starts after three quarters of `think`, since it would
+/// rarely finish in time.
 fn with_think_time(limits: Limits, think: Duration) -> Limits {
     let (Some(soft), Some(hard)) = (limits.soft_time, limits.hard_time) else {
         return limits;
     };
-    if soft == hard {
-        let time = hard.min(think);
-        return Limits {
-            soft_time: Some(time),
-            hard_time: Some(time),
-            ..limits
-        };
-    }
     let capped_hard = hard.min(think);
     let trouble = hard.min(think * 2);
     Limits {
@@ -624,7 +622,7 @@ mod tests {
         let (_, out) = session("uci\nisready");
         assert!(out.starts_with("id name Fishrod "));
         assert!(out.contains("\noption name Move Overhead type spin default 10 min 0 max 5000\n"));
-        assert!(out.contains("\noption name Think Time type spin default 0 min 0 max 60000\n"));
+        assert!(out.contains("\noption name Think Time type spin default 4000 min 0 max 60000\n"));
         assert!(out.contains("\noption name UCI_Chess960 type check default false\n"));
         assert!(out.contains("\noption name UCI_LimitStrength type check default false\n"));
         assert!(out.contains("\noption name UCI_Elo type spin default 1500 min 500 max 2000\n"));
@@ -861,20 +859,20 @@ mod tests {
         let ms = |millis: u64| Some(Duration::from_millis(millis));
 
         // White: (60000 - 10) / 30 + 1000 * 3/4 = 1999 + 750 = 2749 ms target.
-        let limits = go("wtime 60000 btime 30000 winc 1000 binc 0").limits(Color::White, 10);
+        let limits = go("wtime 60000 btime 30000 winc 1000 binc 0").limits(Color::White, 10, 0);
         assert_eq!((limits.soft_time, limits.hard_time), (ms(1374), ms(8247)));
         // Black: (30000 - 10) / 30 = 999 ms target.
-        let limits = go("wtime 60000 btime 30000 winc 1000 binc 0").limits(Color::Black, 10);
+        let limits = go("wtime 60000 btime 30000 winc 1000 binc 0").limits(Color::Black, 10, 0);
         assert_eq!((limits.soft_time, limits.hard_time), (ms(499), ms(2997)));
         // The last move before the time control: never more than half of what is left.
-        let limits = go("wtime 100 btime 100 movestogo 1").limits(Color::White, 10);
+        let limits = go("wtime 100 btime 100 movestogo 1").limits(Color::White, 10, 0);
         assert_eq!(limits.hard_time, ms(45));
 
-        let limits = go("movetime 500").limits(Color::White, 10);
+        let limits = go("movetime 500").limits(Color::White, 10, 0);
         assert_eq!((limits.soft_time, limits.hard_time), (ms(490), ms(490)));
-        let limits = go("infinite wtime 1000").limits(Color::White, 10);
+        let limits = go("infinite wtime 1000").limits(Color::White, 10, 0);
         assert_eq!((limits.soft_time, limits.hard_time), (None, None));
-        let limits = go("depth 7 nodes 1000").limits(Color::White, 10);
+        let limits = go("depth 7 nodes 1000").limits(Color::White, 10, 0);
         assert_eq!(
             (limits.depth, limits.nodes, limits.hard_time),
             (Some(7), Some(1000), None)
@@ -902,40 +900,35 @@ mod tests {
     #[test]
     fn think_time_shortens_the_clock() {
         let ms = |millis: u64| Some(Duration::from_millis(millis));
-        let think = Duration::from_millis(4000);
+        let limits = |args: &str, think: u64| {
+            GoCommand::parse(args)
+                .unwrap()
+                .limits(Color::White, 10, think)
+        };
+        let times = |limits: Limits| (limits.soft_time, limits.hard_time, limits.trouble_time);
 
-        // 10+5: the clock alone allows 11873 ms, or 71241 ms at most.
-        let clock = GoCommand::parse("wtime 600000 btime 600000 winc 5000 binc 5000")
-            .unwrap()
-            .limits(Color::White, 10);
-        let limits = with_think_time(clock, think);
+        // 10+5: the clock alone allows 11874 ms, or 71247 ms at most.
+        let ten_five = "wtime 600000 btime 600000 winc 5000 binc 5000";
+        assert_eq!(times(limits(ten_five, 0)), (ms(11874), ms(71247), None));
         assert_eq!(
-            (limits.soft_time, limits.hard_time, limits.trouble_time),
+            times(limits(ten_five, 4000)),
             (ms(3000), ms(4000), ms(8000))
         );
 
         // Low on time, the clock's limits win and there is no extra time.
-        let short = GoCommand::parse("wtime 3000 btime 3000")
-            .unwrap()
-            .limits(Color::White, 10);
-        let limits = with_think_time(short, think);
+        let short = "wtime 3000 btime 3000";
+        assert_eq!(times(limits(short, 4000)), times(limits(short, 0)));
+
+        // A fixed move time and searches without a time limit are left alone.
         assert_eq!(
-            (limits.soft_time, limits.hard_time, limits.trouble_time),
-            (short.soft_time, short.hard_time, None)
+            times(limits("movetime 10000", 4000)),
+            (ms(9990), ms(9990), None)
         );
+        assert_eq!(times(limits("depth 12", 4000)), (None, None, None));
+        assert_eq!(times(limits("infinite", 4000)), (None, None, None));
 
-        // A fixed move time is capped; other searches are left alone.
-        let fixed = GoCommand::parse("movetime 10000")
-            .unwrap()
-            .limits(Color::White, 10);
-        let limits = with_think_time(fixed, think);
-        assert_eq!((limits.soft_time, limits.hard_time), (ms(4000), ms(4000)));
-        let depth = GoCommand::parse("depth 12")
-            .unwrap()
-            .limits(Color::White, 10);
-        assert_eq!(with_think_time(depth, think).hard_time, None);
-
-        // The option itself.
+        // The option itself, on by default.
+        assert_eq!(Uci::new(Vec::new()).think_time, 4000);
         let (uci, out) = session("setoption name Think Time value 3500");
         assert_eq!((uci.think_time, out.as_str()), (3500, ""));
         let (_, out) = session("setoption name Think Time value 70000");

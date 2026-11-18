@@ -119,6 +119,21 @@ impl OrderedMoves {
             next: 0,
         }
     }
+
+    /// Orders captures and promotions already known to lose no material,
+    /// as `new` would without a first move: by MVV-LVA alone, which spares
+    /// working out each exchange a second time.
+    pub(super) fn safe_captures(pos: &Position, moves: MoveList) -> OrderedMoves {
+        let mut scores = [0; MoveList::CAPACITY];
+        for (score, &mv) in scores.iter_mut().zip(moves.iter()) {
+            *score = tactical_score(pos, mv).unwrap_or(0);
+        }
+        OrderedMoves {
+            moves,
+            scores,
+            next: 0,
+        }
+    }
 }
 
 impl Iterator for OrderedMoves {

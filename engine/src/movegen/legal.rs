@@ -20,12 +20,53 @@ use crate::types::{Bitboard, Color, Move, MoveKind, MoveList, PieceType, Square}
 
 /// All legal moves in `pos`.
 pub fn legal_moves(pos: &Position) -> MoveList {
+    generate::<false>(pos)
+}
+
+/// The legal captures and promotions in `pos`, en passant included: the
+/// moves a quiescence search tries. They come in the same order as in
+/// `legal_moves`, which only adds the other moves among them.
+pub fn legal_captures(pos: &Position) -> MoveList {
+    generate::<true>(pos)
+}
+
+/// Whether the side to move has any legal move. Usually answered without
+/// generating the moves: out of check, a knight or slider that is not pinned
+/// and has somewhere to go settles it.
+pub fn has_legal_move(pos: &Position) -> bool {
+    let us = pos.side_to_move();
+    if pos.checkers().is_empty() {
+        let pinned = pinned_pieces(pos, pos.king_square(us));
+        let free = !pos.occupied_by(us);
+        let occupied = pos.occupied();
+        let queens = pos.pieces_of(us, PieceType::Queen);
+        let unpinned = |pieces: Bitboard| pieces & !pinned;
+        let can_move = unpinned(pos.pieces_of(us, PieceType::Knight))
+            .into_iter()
+            .any(|from| !(knight_attacks(from) & free).is_empty())
+            || unpinned(pos.pieces_of(us, PieceType::Bishop) | queens)
+                .into_iter()
+                .any(|from| !(bishop_attacks(from, occupied) & free).is_empty())
+            || unpinned(pos.pieces_of(us, PieceType::Rook) | queens)
+                .into_iter()
+                .any(|from| !(rook_attacks(from, occupied) & free).is_empty());
+        if can_move {
+            return true;
+        }
+    }
+    !legal_moves(pos).is_empty()
+}
+
+/// The legal moves of `pos`, or only its captures and promotions if
+/// `TACTICAL` is set. A constant parameter, so that each kind is compiled
+/// on its own and the full generation pays nothing for the other.
+fn generate<const TACTICAL: bool>(pos: &Position) -> MoveList {
     let mut list = MoveList::new();
     let us = pos.side_to_move();
     let king = pos.king_square(us);
     let checkers = pos.checkers();
 
-    king_moves(pos, king, &mut list);
+    king_moves::<TACTICAL>(pos, king, &mut list);
     if checkers.more_than_one() {
         return list;
     }
@@ -46,22 +87,33 @@ pub fn legal_moves(pos: &Position) -> MoveList {
         }
     };
 
-    piece_moves(pos, &allowed, &mut list);
-    pawn_moves(pos, &allowed, &mut list);
-    if checkers.is_empty() {
+    piece_moves::<TACTICAL>(pos, &allowed, &mut list);
+    pawn_moves::<TACTICAL>(pos, &allowed, &mut list);
+    if checkers.is_empty() && !TACTICAL {
         castling_moves(pos, king, &mut list);
     }
     list
 }
 
-/// King steps to squares the opponent does not attack.
-fn king_moves(pos: &Position, king: Square, list: &mut MoveList) {
+/// The squares a move may go to: any square, or with `TACTICAL` only those
+/// of the opponent's pieces.
+fn destinations<const TACTICAL: bool>(pos: &Position) -> Bitboard {
+    if TACTICAL {
+        pos.occupied_by(!pos.side_to_move())
+    } else {
+        Bitboard::FULL
+    }
+}
+
+/// King steps to squares the opponent does not attack; with `TACTICAL`,
+/// captures only.
+fn king_moves<const TACTICAL: bool>(pos: &Position, king: Square, list: &mut MoveList) {
     let us = pos.side_to_move();
     let theirs = pos.occupied_by(!us);
     // Lift the king off the board first: a slider checking it along a line
     // also attacks the square behind it, which the king itself hides now.
     let without_king = pos.occupied().without(king);
-    for to in king_attacks(king) & !pos.occupied_by(us) {
+    for to in king_attacks(king) & !pos.occupied_by(us) & destinations::<TACTICAL>(pos) {
         if (pos.attackers_to(to, without_king) & theirs).is_empty() {
             list.push(Move::new(king, to, MoveKind::Normal));
         }
@@ -90,12 +142,18 @@ fn pinned_pieces(pos: &Position, king: Square) -> Bitboard {
     pinned
 }
 
-/// Knight, bishop, rook and queen moves. `allowed` gives each piece's permitted destinations.
-fn piece_moves(pos: &Position, allowed: &impl Fn(Square) -> Bitboard, list: &mut MoveList) {
+/// Knight, bishop, rook and queen moves. `allowed` gives each piece's
+/// permitted destinations; with `TACTICAL`, captures only.
+fn piece_moves<const TACTICAL: bool>(
+    pos: &Position,
+    allowed: &impl Fn(Square) -> Bitboard,
+    list: &mut MoveList,
+) {
     let us = pos.side_to_move();
     let occupied = pos.occupied();
+    let mask = destinations::<TACTICAL>(pos);
     let mut add = |from: Square, attacks: Bitboard| {
-        for to in attacks & allowed(from) {
+        for to in attacks & allowed(from) & mask {
             list.push(Move::new(from, to, MoveKind::Normal));
         }
     };
@@ -114,14 +172,19 @@ fn piece_moves(pos: &Position, allowed: &impl Fn(Square) -> Bitboard, list: &mut
     }
 }
 
-/// Pawn pushes, captures, promotions and en passant captures.
-fn pawn_moves(pos: &Position, allowed: &impl Fn(Square) -> Bitboard, list: &mut MoveList) {
+/// Pawn pushes, captures, promotions and en passant captures. With
+/// `TACTICAL`, pushes are left out unless they promote.
+fn pawn_moves<const TACTICAL: bool>(
+    pos: &Position,
+    allowed: &impl Fn(Square) -> Bitboard,
+    list: &mut MoveList,
+) {
     let us = pos.side_to_move();
     let occupied = pos.occupied();
     let theirs = pos.occupied_by(!us);
-    let (forward, start_rank) = match us {
-        Color::White => (1, 1),
-        Color::Black => (-1, 6),
+    let (forward, start_rank, last_rank) = match us {
+        Color::White => (1, 1, 7),
+        Color::Black => (-1, 6, 0),
     };
 
     for from in pos.pieces_of(us, PieceType::Pawn) {
@@ -131,10 +194,11 @@ fn pawn_moves(pos: &Position, allowed: &impl Fn(Square) -> Bitboard, list: &mut 
         if let Some(one) = from.offset(0, forward)
             && !occupied.contains(one)
         {
-            if allowed.contains(one) {
+            if allowed.contains(one) && (!TACTICAL || one.rank() == last_rank) {
                 push_pawn_move(list, from, one);
             }
-            if from.rank() == start_rank
+            if !TACTICAL
+                && from.rank() == start_rank
                 && let Some(two) = one.offset(0, forward)
                 && !occupied.contains(two)
                 && allowed.contains(two)
@@ -298,6 +362,70 @@ mod tests {
         let moves = legal_moves(&pos);
         assert_eq!(moves.len(), 4);
         assert!(moves.iter().all(|mv| mv.from() == Square::E1));
+    }
+
+    /// The legal moves of every position in the perft tree of `fen` up to
+    /// `depth`, visited one by one.
+    fn for_each_position(pos: &Position, depth: u32, visit: &mut impl FnMut(&Position)) {
+        visit(pos);
+        if depth > 0 {
+            for &mv in legal_moves(pos).iter() {
+                for_each_position(&pos.make_move(mv), depth - 1, visit);
+            }
+        }
+    }
+
+    const TREES: [(&str, u32); 5] = [
+        (Position::STARTPOS_FEN, 3),
+        (
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            2,
+        ),
+        ("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", 4),
+        (
+            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+            3,
+        ),
+        (
+            "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+            2,
+        ),
+    ];
+
+    #[test]
+    fn captures_are_the_tactical_moves_in_the_same_order() {
+        for (fen, depth) in TREES {
+            let root = Position::from_fen(fen).unwrap();
+            for_each_position(&root, depth, &mut |pos| {
+                let expected: Vec<Move> = legal_moves(pos)
+                    .iter()
+                    .copied()
+                    .filter(|&mv| {
+                        mv.kind() != MoveKind::Castle
+                            && (pos.piece_on(mv.to()).is_some()
+                                || matches!(
+                                    mv.kind(),
+                                    MoveKind::EnPassant | MoveKind::Promotion(_)
+                                ))
+                    })
+                    .collect();
+                assert_eq!(legal_captures(pos).to_vec(), expected, "{pos:?}");
+            });
+        }
+    }
+
+    #[test]
+    fn the_quick_legal_move_check_agrees() {
+        for (fen, depth) in TREES {
+            let root = Position::from_fen(fen).unwrap();
+            for_each_position(&root, depth, &mut |pos| {
+                assert_eq!(has_legal_move(pos), !legal_moves(pos).is_empty(), "{pos:?}");
+            });
+        }
+        // Checkmate and stalemate.
+        let mated = Position::from_fen("R5k1/5ppp/8/8/8/8/8/6K1 b - - 0 1").unwrap();
+        let stalemated = Position::from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1").unwrap();
+        assert!(!has_legal_move(&mated) && !has_legal_move(&stalemated));
     }
 
     #[test]
