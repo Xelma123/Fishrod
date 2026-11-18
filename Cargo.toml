@@ -1,5 +1,5 @@
 [workspace]
-members = ["engine"]
+members = ["engine", "web"]
 default-members = ["engine"]
 resolver = "3"
 

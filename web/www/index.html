@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fishrod</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 16px; max-width: 640px; }
+    button { font-size: 1rem; padding: 8px 12px; margin: 4px 4px 4px 0; }
+    pre { background: #f2f2f2; padding: 12px; white-space: pre-wrap; word-break: break-word; }
+  </style>
+</head>
+<body>
+  <h1>Fishrod</h1>
+  <p>WebAssembly denemesi: motor bu sayfada, tarayıcının içinde çalışıyor.</p>
+  <p>
+    <button id="state">Başlangıç pozisyonu</button>
+    <button id="play">1.e4'e cevap ver</button>
+    <button id="bench">Hız testi</button>
+  </p>
+  <pre id="output">Motor yükleniyor…</pre>
+  <script type="module">
+    const worker = new Worker("engine-worker.js", { type: "module" });
+    const output = document.getElementById("output");
+    let nextId = 0;
+    const waiting = new Map();
+    worker.onmessage = ({ data }) => {
+      waiting.get(data.id)(data);
+      waiting.delete(data.id);
+    };
+    function ask(command) {
+      const id = nextId++;
+      return new Promise((resolve) => {
+        waiting.set(id, resolve);
+        worker.postMessage({ id, command });
+      });
+    }
+    async function show(label, command) {
+      output.textContent = `${label}…`;
+      const started = performance.now();
+      const { answer, error } = await ask(command);
+      const millis = Math.round(performance.now() - started);
+      output.textContent = error ? `Hata: ${error}` : `${answer}\n\n(${millis} ms)`;
+    }
+    document.getElementById("state").onclick = () => show("Hesaplanıyor", "state");
+    document.getElementById("play").onclick = () => show("Düşünüyor", "play 3000 10 0 " + Date.now() + " e2e4");
+    document.getElementById("bench").onclick = () => show("Hız testi sürüyor", "bench");
+    show("Motor yükleniyor", "state");
+  </script>
+</body>
+</html>

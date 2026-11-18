@@ -1,0 +1,12 @@
+[package]
+name = "fishrod-web"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "The Fishrod engine for web pages, compiled to WebAssembly"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fishrod = { path = "../engine" }

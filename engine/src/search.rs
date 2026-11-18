@@ -827,7 +827,7 @@ fn has_pieces(pos: &Position) -> bool {
 
 /// Whether neither side has enough material left to mate: no pawns, rooks or
 /// queens, and at most one knight or bishop on the board.
-fn insufficient_material(pos: &Position) -> bool {
+pub fn insufficient_material(pos: &Position) -> bool {
     let decisive =
         pos.pieces(PieceType::Pawn) | pos.pieces(PieceType::Rook) | pos.pieces(PieceType::Queen);
     let minors = pos.pieces(PieceType::Knight) | pos.pieces(PieceType::Bishop);

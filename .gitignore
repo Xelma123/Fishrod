@@ -35,3 +35,5 @@ BASLANGIC_PROMPTU.md
 docs/
 
 DEVIR.md
+# Web version: the engine module is built by tools/build-web.sh
+/web/www/fishrod.wasm
