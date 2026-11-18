@@ -755,16 +755,18 @@ function bind() {
     save();
   });
 
-  $("new-game-dialog").addEventListener("close", () => {
-    const dialog = $("new-game-dialog");
-    if (dialog.returnValue !== "start") return;
-    const form = $("new-game-form");
+  // The dialogs act on the button pressed, as the form is submitted; the
+  // form then closes its dialog by itself (method="dialog").
+  $("new-game-form").addEventListener("submit", (event) => {
+    if (event.submitter?.value !== "start") return;
+    const form = event.currentTarget;
     newGame(form.elements.color.value, form.elements.level.value);
   });
-  $("result-dialog").addEventListener("close", () => {
-    const value = $("result-dialog").returnValue;
+  $("result-dialog").querySelector("form").addEventListener("submit", (event) => {
+    const value = event.submitter?.value;
     if (value === "pgn") copyPgn();
-    if (value === "new") openNewGame();
+    // Once this dialog has closed.
+    if (value === "new") setTimeout(openNewGame);
   });
 }
 
@@ -789,3 +791,10 @@ async function start() {
 }
 
 run(start);
+
+// Offline use and installing as an app. Not while developing on this
+// machine, where stored copies would hide every change.
+const local = ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
+if ("serviceWorker" in navigator && !local) {
+  navigator.serviceWorker.register("sw.js").catch((error) => console.warn("Service worker:", error));
+}

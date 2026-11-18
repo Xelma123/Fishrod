@@ -1,5 +1,8 @@
 // Checks the WebAssembly engine from Node, through the same loader the page
 // uses. Build it first with tools/build-web.sh, then: node web/test.mjs
+//
+// Given the node count of the native `fishrod bench`, it also checks that
+// the WebAssembly build searches exactly the same: node web/test.mjs 162003
 
 import { readFile } from "node:fs/promises";
 import { loadEngine } from "./www/fishrod.js";
@@ -27,6 +30,11 @@ check("mate in one", mateInOne, mateInOne.startsWith("bestmove d8h4 "));
 check("new game", engine.command("newgame"), engine.command("newgame") === "ok");
 
 const bench = engine.command("bench");
-check("bench", bench, bench.startsWith("162003 nodes "));
+const expected = process.argv[2];
+check(
+  expected ? `bench equals the native ${expected}` : "bench",
+  bench,
+  expected ? bench.startsWith(`${expected} nodes `) : /^\d+ nodes \d+ nps$/.test(bench)
+);
 
 process.exit(failures === 0 ? 0 : 1);

@@ -1,0 +1,58 @@
+# Builds the web version and publishes it on GitHub Pages.
+#
+# On every push to the main branch the engine is compiled to WebAssembly,
+# checked against the native build (the same bench node count), and the
+# page in web/www is published. In the repository settings, Pages must use
+# "GitHub Actions" as its source.
+
+name: Web version
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the WebAssembly target
+        run: rustup target add wasm32-wasip1
+
+      - name: Build the engine for the web
+        run: bash tools/build-web.sh
+
+      - name: Check it searches like the native build
+        run: |
+          expected=$(cargo run --release -- bench | tail -n 1 | cut -d ' ' -f 1)
+          node web/test.mjs "$expected"
+
+      - name: Stamp the offline cache with this version
+        run: sed -i "s/__VERSION__/${GITHUB_SHA::12}/" web/www/sw.js
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/www
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

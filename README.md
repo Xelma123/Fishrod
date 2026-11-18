@@ -47,6 +47,8 @@ python -m http.server 8000 --directory web/www
 
 Then open <http://localhost:8000>.
 
+On every push, a GitHub Actions workflow builds the web version, checks that it searches exactly like the native build, and publishes it on GitHub Pages. The page can be installed as an app from the browser and works without a connection.
+
 ## Testing
 
 - **Perft:** move generation is checked against published node counts for standard and Chess960 test positions.
