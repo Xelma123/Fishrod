@@ -76,6 +76,12 @@ const ASPIRATION_MIN_DEPTH: u32 = 4;
 const ASPIRATION_DELTA: i32 = 25;
 /// Internal iterative reduction applies from this depth.
 const IIR_MIN_DEPTH: i32 = 4;
+/// A search counts as in trouble (see `Limits::trouble_time`) from this
+/// depth on, when its score falls by this many centipawns from one iteration
+/// to the next or is this many centipawns below level.
+const TROUBLE_MIN_DEPTH: u32 = 6;
+const TROUBLE_DROP: i32 = 30;
+const TROUBLE_SCORE: i32 = 100;
 
 /// How many moves a node at `depth` searches before late move pruning
 /// skips its remaining quiet moves.
@@ -108,6 +114,11 @@ pub struct Limits {
     pub soft_time: Option<Duration>,
     /// The search stops once this much time has passed, even mid-iteration.
     pub hard_time: Option<Duration>,
+    /// More time for a search in trouble: once an iteration's score falls
+    /// clearly below the previous one's, or shows a clearly worse position,
+    /// the hard limit becomes this and the soft limit halfway between it and
+    /// `hard_time`. Unset, the limits never change.
+    pub trouble_time: Option<Duration>,
     /// Search every root move with a full window, so that each one gets an
     /// exact score in `Outcome::root_scores`. Slower: there are no cutoffs at
     /// the root. Used to play below full strength.
@@ -196,6 +207,8 @@ pub fn search(
         .unwrap_or(MAX_PLY as u32)
         .clamp(1, MAX_PLY as u32 - 1);
     let mut pv = MoveList::new();
+    let mut soft_time = limits.soft_time;
+    let mut in_trouble = false;
     for depth in 1..=max_depth {
         // Aspiration windows: the score rarely moves far from one iteration
         // to the next, so the search starts with a narrow window around the
@@ -229,6 +242,15 @@ pub fn search(
         if searcher.stopped {
             break;
         }
+        // A search that finds itself in trouble gets more time, once.
+        if let Some(trouble_time) = limits.trouble_time
+            && !in_trouble
+            && is_trouble(outcome.score, score, depth)
+        {
+            in_trouble = true;
+            soft_time = limits.hard_time.map(|hard| (hard + trouble_time) / 2);
+            searcher.hard_time = Some(trouble_time);
+        }
         outcome = Outcome {
             best_move: pv.first().copied().or(outcome.best_move),
             score,
@@ -249,8 +271,8 @@ pub fn search(
         // Another iteration would likely take several times as long as this
         // one, so none is started once the soft limit has passed. With a
         // single legal move there is nothing to choose, under a clock.
-        let timed = limits.soft_time.is_some();
-        let soft_limit_passed = limits.soft_time.is_some_and(|soft| start.elapsed() >= soft);
+        let timed = soft_time.is_some();
+        let soft_limit_passed = soft_time.is_some_and(|soft| start.elapsed() >= soft);
         if soft_limit_passed || (timed && root_moves.len() == 1) || stop.load(Ordering::Relaxed) {
             break;
         }
@@ -697,6 +719,14 @@ impl Searcher<'_> {
     }
 }
 
+/// Whether a completed iteration at `depth`, scoring `score` after the
+/// previous iteration scored `previous`, shows the search in trouble: its
+/// score has just fallen clearly, or the position is clearly worse. Shallow
+/// iterations are too unsettled to tell.
+fn is_trouble(previous: i32, score: i32, depth: u32) -> bool {
+    depth >= TROUBLE_MIN_DEPTH && (score <= previous - TROUBLE_DROP || score <= -TROUBLE_SCORE)
+}
+
 /// Whether the side to move has a knight, bishop, rook or queen.
 fn has_pieces(pos: &Position) -> bool {
     let us = pos.side_to_move();
@@ -983,6 +1013,45 @@ mod tests {
         let after_clear = search(&kiwipete, &[], depth(5), &tt, &stop, |_| {});
         assert_eq!(after_clear.nodes, first.nodes);
         assert_eq!(after_clear.best_move, first.best_move);
+    }
+
+    #[test]
+    fn trouble_is_a_falling_score_or_a_worse_position() {
+        assert!(is_trouble(20, -15, 8));
+        assert!(is_trouble(0, -150, 8));
+        // Small swings, rising scores and good positions are no trouble.
+        assert!(!is_trouble(20, 0, 8));
+        assert!(!is_trouble(-50, 40, 8));
+        assert!(!is_trouble(300, 290, 12));
+        // Shallow iterations do not count.
+        assert!(!is_trouble(0, -500, TROUBLE_MIN_DEPTH - 1));
+    }
+
+    #[test]
+    fn a_search_in_trouble_takes_more_time() {
+        // Black has lost the queen: clearly worse.
+        let lost =
+            Position::from_fen("rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1").unwrap();
+        let plain = Limits {
+            soft_time: Some(Duration::from_millis(100)),
+            hard_time: Some(Duration::from_millis(300)),
+            ..Limits::default()
+        };
+        let timed = |limits| {
+            let start = Instant::now();
+            search_quietly(&lost, &[], limits);
+            start.elapsed()
+        };
+        // Without extra time, the hard limit holds.
+        let elapsed = timed(plain);
+        assert!(elapsed < Duration::from_millis(800), "{elapsed:?}");
+        // With it, the search keeps going at least until the plain hard limit.
+        let elapsed = timed(Limits {
+            trouble_time: Some(Duration::from_millis(1200)),
+            ..plain
+        });
+        assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(3000), "{elapsed:?}");
     }
 
     #[test]
