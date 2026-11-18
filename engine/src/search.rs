@@ -76,12 +76,18 @@ const ASPIRATION_MIN_DEPTH: u32 = 4;
 const ASPIRATION_DELTA: i32 = 25;
 /// Internal iterative reduction applies from this depth.
 const IIR_MIN_DEPTH: i32 = 4;
-/// A search counts as in trouble (see `Limits::trouble_time`) from this
+/// A search counts as in trouble (see `Pace`) from this
 /// depth on, when its score falls by this many centipawns from one iteration
 /// to the next or is this many centipawns below level.
 const TROUBLE_MIN_DEPTH: u32 = 6;
 const TROUBLE_DROP: i32 = 30;
 const TROUBLE_SCORE: i32 = 100;
+/// A change of best move from this depth on unsettles the search; the same
+/// best move for this many iterations in a row makes it easy (see `Pace`).
+const UNSETTLED_MIN_DEPTH: u32 = 8;
+const EASY_ITERATIONS: u32 = 6;
+/// From this score on, the search never asks for more time.
+const COMFORTABLE_SCORE: i32 = 250;
 
 /// How many moves a node at `depth` searches before late move pruning
 /// skips its remaining quiet moves.
@@ -114,11 +120,12 @@ pub struct Limits {
     pub soft_time: Option<Duration>,
     /// The search stops once this much time has passed, even mid-iteration.
     pub hard_time: Option<Duration>,
-    /// More time for a search in trouble: once an iteration's score falls
-    /// clearly below the previous one's, or shows a clearly worse position,
-    /// the hard limit becomes this and the soft limit halfway between it and
-    /// `hard_time`. Unset, the limits never change.
-    pub trouble_time: Option<Duration>,
+    /// The most a move may take when the search turns out to need more time
+    /// than `hard_time`. Setting it, along with the other two time limits,
+    /// lets the time follow the search, for games against people (see
+    /// `Pace`): easy moves come sooner, unsettled and difficult ones later.
+    /// Unset, the limits never change.
+    pub max_time: Option<Duration>,
     /// Search every root move with a full window, so that each one gets an
     /// exact score in `Outcome::root_scores`. Slower: there are no cutoffs at
     /// the root. Used to play below full strength.
@@ -208,7 +215,9 @@ pub fn search(
         .clamp(1, MAX_PLY as u32 - 1);
     let mut pv = MoveList::new();
     let mut soft_time = limits.soft_time;
-    let mut in_trouble = false;
+    let mut pace = Pace::Normal;
+    // Completed iterations in a row that kept the same best move.
+    let mut stable_iterations = 0;
     for depth in 1..=max_depth {
         // Aspiration windows: the score rarely moves far from one iteration
         // to the next, so the search starts with a narrow window around the
@@ -242,17 +251,23 @@ pub fn search(
         if searcher.stopped {
             break;
         }
-        // A search that finds itself in trouble gets more time, once.
-        if let Some(trouble_time) = limits.trouble_time
-            && !in_trouble
-            && is_trouble(outcome.score, score, depth)
+        let best_move = pv.first().copied().or(outcome.best_move);
+        if depth > 1 && best_move == outcome.best_move {
+            stable_iterations += 1;
+        } else {
+            stable_iterations = 0;
+        }
+        // Games against people: the time follows how the search goes.
+        if let (Some(max), Some(soft), Some(hard)) =
+            (limits.max_time, limits.soft_time, limits.hard_time)
         {
-            in_trouble = true;
-            soft_time = limits.hard_time.map(|hard| (hard + trouble_time) / 2);
-            searcher.hard_time = Some(trouble_time);
+            pace = pace.next(outcome.score, score, depth, stable_iterations);
+            let (new_soft, new_hard) = pace.limits(soft, hard, max);
+            soft_time = Some(new_soft);
+            searcher.hard_time = Some(new_hard);
         }
         outcome = Outcome {
-            best_move: pv.first().copied().or(outcome.best_move),
+            best_move,
             score,
             depth,
             nodes: searcher.nodes,
@@ -739,6 +754,56 @@ impl Searcher<'_> {
     }
 }
 
+/// How a search with adaptive time (`Limits::max_time`) is going, from the
+/// least time needed to the most.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Pace {
+    /// The best move has stood for several iterations: no need to wait.
+    Easy,
+    Normal,
+    /// The best move has just changed: the search may want a deeper look.
+    Unsettled,
+    /// The score has fallen, or the position is clearly worse.
+    Trouble,
+}
+
+impl Pace {
+    /// The pace after a completed iteration at `depth` that scored `score`
+    /// after the previous iteration's `previous`, with the best move the same
+    /// for `stable_iterations` iterations in a row. A search that has once
+    /// needed more time keeps it; only a normal search becomes easy.
+    fn next(self, previous: i32, score: i32, depth: u32, stable_iterations: u32) -> Pace {
+        // Far ahead, a wobbling score or a change of plan is no reason to
+        // take longer: any of the winning moves will do.
+        let comfortable = score >= COMFORTABLE_SCORE;
+        let now = if !comfortable && is_trouble(previous, score, depth) {
+            Pace::Trouble
+        } else if !comfortable && depth >= UNSETTLED_MIN_DEPTH && stable_iterations == 0 {
+            Pace::Unsettled
+        } else if stable_iterations >= EASY_ITERATIONS {
+            Pace::Easy
+        } else {
+            Pace::Normal
+        };
+        match (self, now) {
+            (Pace::Easy | Pace::Normal, Pace::Easy) => Pace::Easy,
+            _ => self.max(now),
+        }
+    }
+
+    /// The soft and hard limits at this pace, from the plain ones and the
+    /// most a move may take.
+    fn limits(self, soft: Duration, hard: Duration, max: Duration) -> (Duration, Duration) {
+        let midway = (hard + max) / 2;
+        match self {
+            Pace::Easy => (soft / 2, hard),
+            Pace::Normal => (soft, hard),
+            Pace::Unsettled => (hard, midway),
+            Pace::Trouble => (midway, max),
+        }
+    }
+}
+
 /// Whether a completed iteration at `depth`, scoring `score` after the
 /// previous iteration scored `previous`, shows the search in trouble: its
 /// score has just fallen clearly, or the position is clearly worse. Shallow
@@ -1048,6 +1113,32 @@ mod tests {
     }
 
     #[test]
+    fn the_pace_follows_the_search() {
+        use Pace::*;
+        // A best move standing for six iterations makes an easy move...
+        assert_eq!(Normal.next(10, 12, 12, EASY_ITERATIONS), Easy);
+        assert_eq!(Normal.next(10, 12, 12, EASY_ITERATIONS - 1), Normal);
+        // ...a new best move at depth 8 or more an unsettled one...
+        assert_eq!(Easy.next(10, 12, 12, 0), Unsettled);
+        assert_eq!(Normal.next(10, 12, UNSETTLED_MIN_DEPTH - 1, 0), Normal);
+        // ...and a falling score trouble, which outranks the rest.
+        assert_eq!(Unsettled.next(10, -40, 12, 0), Trouble);
+        // Far ahead, neither a falling score nor a new best move needs time.
+        assert_eq!(Normal.next(700, 600, 12, 0), Normal);
+        assert_eq!(Normal.next(700, 650, 12, EASY_ITERATIONS), Easy);
+        // Once more time was needed, it stays: no going back to easy.
+        assert_eq!(Unsettled.next(10, 12, 14, EASY_ITERATIONS), Unsettled);
+        assert_eq!(Trouble.next(10, 12, 14, EASY_ITERATIONS), Trouble);
+
+        let ms = Duration::from_millis;
+        let limits = |pace: Pace| pace.limits(ms(3000), ms(4000), ms(8000));
+        assert_eq!(limits(Easy), (ms(1500), ms(4000)));
+        assert_eq!(limits(Normal), (ms(3000), ms(4000)));
+        assert_eq!(limits(Unsettled), (ms(4000), ms(6000)));
+        assert_eq!(limits(Trouble), (ms(6000), ms(8000)));
+    }
+
+    #[test]
     fn a_search_in_trouble_takes_more_time() {
         // Black has lost the queen: clearly worse.
         let lost =
@@ -1067,7 +1158,7 @@ mod tests {
         assert!(elapsed < Duration::from_millis(800), "{elapsed:?}");
         // With it, the search keeps going at least until the plain hard limit.
         let elapsed = timed(Limits {
-            trouble_time: Some(Duration::from_millis(1200)),
+            max_time: Some(Duration::from_millis(1200)),
             ..plain
         });
         assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");

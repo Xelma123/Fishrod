@@ -1,4 +1,5 @@
-//! Playing below full strength (`UCI_LimitStrength`).
+//! Playing below full strength (`UCI_LimitStrength`), and picking among
+//! nearly equal moves for variety (`Variety`).
 //!
 //! Two knobs, both turned by one Elo setting: the search goes less deep, and
 //! the move played is drawn at random from those that score not much worse
@@ -41,28 +42,28 @@ impl Strength {
     pub(crate) fn margin(self) -> i32 {
         ((Self::MAX_ELO - self.elo) / 5) as i32
     }
+}
 
-    /// Picks a move from the scored root moves. Every move within the margin
-    /// of the best can be picked, with a chance that grows the closer it
-    /// scores to the best. `None` if there are no moves.
-    pub(crate) fn choose(self, scores: &[(Move, i32)], rng: &mut Rng) -> Option<Move> {
-        let best = scores.iter().map(|&(_, score)| score).max()?;
-        let margin = self.margin();
-        let candidates: Vec<(Move, u64)> = scores
-            .iter()
-            .filter(|&&(_, score)| best - score <= margin)
-            .map(|&(mv, score)| (mv, (margin - (best - score) + 1) as u64))
-            .collect();
-        let total: u64 = candidates.iter().map(|&(_, weight)| weight).sum();
-        let mut ticket = rng.next_u64() % total;
-        for &(mv, weight) in &candidates {
-            if ticket < weight {
-                return Some(mv);
-            }
-            ticket -= weight;
+/// Picks a move from the scored root moves. Every move within `margin`
+/// centipawns of the best can be picked, with a chance that grows the closer
+/// it scores to the best; with a margin of 0, the best move. `None` if there
+/// are no moves.
+pub(crate) fn choose_near_best(scores: &[(Move, i32)], margin: i32, rng: &mut Rng) -> Option<Move> {
+    let best = scores.iter().map(|&(_, score)| score).max()?;
+    let candidates: Vec<(Move, u64)> = scores
+        .iter()
+        .filter(|&&(_, score)| best - score <= margin)
+        .map(|&(mv, score)| (mv, (margin - (best - score) + 1) as u64))
+        .collect();
+    let total: u64 = candidates.iter().map(|&(_, weight)| weight).sum();
+    let mut ticket = rng.next_u64() % total;
+    for &(mv, weight) in &candidates {
+        if ticket < weight {
+            return Some(mv);
         }
-        candidates.last().map(|&(mv, _)| mv)
+        ticket -= weight;
     }
+    candidates.last().map(|&(mv, _)| mv)
 }
 
 #[cfg(test)]
@@ -89,20 +90,23 @@ mod tests {
         let mut rng = Rng::new(3);
 
         // Full strength always plays the best move.
-        let strongest = Strength::new(Strength::MAX_ELO);
+        let strongest = Strength::new(Strength::MAX_ELO).margin();
         for _ in 0..100 {
-            assert_eq!(strongest.choose(&scores, &mut rng), Some(good));
+            assert_eq!(choose_near_best(&scores, strongest, &mut rng), Some(good));
         }
 
         // The weakest setting varies between the two close moves, but never
         // throws away 600 centipawns.
-        let weakest = Strength::new(Strength::MIN_ELO);
+        let weakest = Strength::new(Strength::MIN_ELO).margin();
         let picks: Vec<Move> = (0..1000)
-            .map(|_| weakest.choose(&scores, &mut rng).unwrap())
+            .map(|_| choose_near_best(&scores, weakest, &mut rng).unwrap())
             .collect();
         assert!(picks.contains(&good) && picks.contains(&close));
         assert!(!picks.contains(&blunder));
+        // Closer moves are more likely: the best one is picked more often.
+        let count = |mv| picks.iter().filter(|&&pick| pick == mv).count();
+        assert!(count(good) > count(close));
 
-        assert_eq!(weakest.choose(&[], &mut rng), None);
+        assert_eq!(choose_near_best(&[], weakest, &mut rng), None);
     }
 }

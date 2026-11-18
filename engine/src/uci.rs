@@ -20,7 +20,7 @@ use crate::board::Position;
 use crate::eval::evaluate;
 use crate::movegen::legal_moves;
 use crate::rng::Rng;
-use crate::search::strength::Strength;
+use crate::search::strength::{Strength, choose_near_best};
 use crate::search::{Limits, Report, TranspositionTable, mate_in, search};
 use crate::types::{Color, Move, MoveKind};
 
@@ -35,6 +35,11 @@ const MOVE_OVERHEAD_MAX: u64 = 5_000;
 /// default, for brisk games against people.
 const THINK_TIME_DEFAULT: u64 = 4_000;
 const THINK_TIME_MAX: u64 = 60_000;
+/// Default and largest `Variety`, in centipawns; 0 turns it off.
+const VARIETY_DEFAULT: u32 = 10;
+const VARIETY_MAX: u32 = 100;
+/// `Variety` applies up to this move number.
+const VARIETY_MOVES: u16 = 10;
 /// Moves assumed to remain until the next time control when the GUI does
 /// not say (`movestogo`).
 const DEFAULT_MOVES_TO_GO: u64 = 30;
@@ -62,6 +67,10 @@ struct Uci<W> {
     /// `Think Time`, in milliseconds: how long a move may take at most, for
     /// brisk games against people. 0 means the clock alone decides.
     think_time: u64,
+    /// `Variety`, in centipawns: in the first `VARIETY_MOVES` moves of a
+    /// game, the move played is drawn from those within this much of the
+    /// best, so that games do not all open alike. 0 turns it off.
+    variety: u32,
     /// `UCI_LimitStrength`: play at the strength set by `UCI_Elo`.
     limit_strength: bool,
     /// `UCI_Elo`.
@@ -130,6 +139,7 @@ impl<W: Write + Send + 'static> Uci<W> {
             chess960: false,
             move_overhead: MOVE_OVERHEAD_DEFAULT,
             think_time: THINK_TIME_DEFAULT,
+            variety: VARIETY_DEFAULT,
             limit_strength: false,
             elo: Strength::DEFAULT_ELO,
             game_log: None,
@@ -210,6 +220,9 @@ impl<W: Write + Send + 'static> Uci<W> {
         self.say(format_args!(
             "option name Think Time type spin default {THINK_TIME_DEFAULT} min 0 max {THINK_TIME_MAX}"
         ))?;
+        self.say(format_args!(
+            "option name Variety type spin default {VARIETY_DEFAULT} min 0 max {VARIETY_MAX}"
+        ))?;
         self.say("option name UCI_Chess960 type check default false")?;
         self.say("option name UCI_LimitStrength type check default false")?;
         self.say(format_args!(
@@ -241,7 +254,19 @@ impl<W: Write + Send + 'static> Uci<W> {
                 .depth
                 .map_or(strength.depth(), |d| d.min(strength.depth()));
             limits.depth = Some(depth);
+        }
+        // How far below the best a played move may score: the strength
+        // setting's margin, or else, early in the game, `Variety`. Choosing
+        // needs every root move's exact score.
+        let choice_margin = match strength {
+            Some(strength) => Some(strength.margin()),
+            None => self.uses_variety(&command).then_some(self.variety as i32),
+        };
+        if choice_margin.is_some() {
             limits.exact_root_scores = true;
+            // The best move changes often among nearly equal ones, which is
+            // no reason to think longer when one of them is drawn anyway.
+            limits.max_time = None;
         }
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -263,14 +288,11 @@ impl<W: Write + Send + 'static> Uci<W> {
                 let _ = write_line(&out, info_line(report, tt.hashfull(), chess960));
             });
             let time = start.elapsed();
-            let played = match strength {
-                Some(strength) => {
-                    // Seeded from the clock, so a weakened engine does not
-                    // repeat itself from game to game.
+            let played = match choice_margin {
+                Some(margin) => {
+                    // Seeded from the clock, so that games differ.
                     let mut rng = Rng::new(position.key() ^ clock_seed());
-                    strength
-                        .choose(&outcome.root_scores, &mut rng)
-                        .or(outcome.best_move)
+                    choose_near_best(&outcome.root_scores, margin, &mut rng).or(outcome.best_move)
                 }
                 None => outcome.best_move,
             };
@@ -307,6 +329,13 @@ impl<W: Write + Send + 'static> Uci<W> {
             unbounded,
         });
         Ok(())
+    }
+
+    /// Whether `Variety` picks the move for `command`: early in the game,
+    /// when the search will end by itself. An analysis (`go infinite`) only
+    /// wants the best move.
+    fn uses_variety(&self, command: &GoCommand) -> bool {
+        self.variety > 0 && !command.infinite && self.position.fullmove_number() <= VARIETY_MOVES
     }
 
     /// Stops the search, if one is running, and waits until it has printed
@@ -396,6 +425,7 @@ impl<W: Write + Send + 'static> Uci<W> {
             }
             "move overhead" => self.move_overhead = parse_spin(&value, 0, MOVE_OVERHEAD_MAX)?,
             "think time" => self.think_time = parse_spin(&value, 0, THINK_TIME_MAX)?,
+            "variety" => self.variety = parse_spin(&value, 0, VARIETY_MAX.into())? as u32,
             "uci_chess960" => self.chess960 = parse_check(&value)?,
             "uci_limitstrength" => self.limit_strength = parse_check(&value)?,
             "uci_elo" => {
@@ -489,21 +519,21 @@ impl GoCommand {
     }
 }
 
-/// Shortens the clock's `limits` to `Think Time`: a move normally takes at
-/// most `think`, and up to twice that when the search finds itself in
-/// trouble. The clock's own limits still apply when they are shorter. No
-/// new iteration starts after three quarters of `think`, since it would
-/// rarely finish in time.
+/// Shortens the clock's `limits` to `Think Time` and lets the time adapt
+/// (`Limits::max_time`): a move normally takes at most `think`, easy ones
+/// less, and unsettled or difficult ones up to twice as long. The clock's
+/// own limits still apply when they are shorter. No new iteration starts
+/// after three quarters of `think`, since it would rarely finish in time.
 fn with_think_time(limits: Limits, think: Duration) -> Limits {
     let (Some(soft), Some(hard)) = (limits.soft_time, limits.hard_time) else {
         return limits;
     };
     let capped_hard = hard.min(think);
-    let trouble = hard.min(think * 2);
+    let max = hard.min(think * 2);
     Limits {
         soft_time: Some(soft.min(think * 3 / 4)),
         hard_time: Some(capped_hard),
-        trouble_time: (trouble > capped_hard).then_some(trouble),
+        max_time: (max > capped_hard).then_some(max),
         ..limits
     }
 }
@@ -623,6 +653,7 @@ mod tests {
         assert!(out.starts_with("id name Fishrod "));
         assert!(out.contains("\noption name Move Overhead type spin default 10 min 0 max 5000\n"));
         assert!(out.contains("\noption name Think Time type spin default 4000 min 0 max 60000\n"));
+        assert!(out.contains("\noption name Variety type spin default 10 min 0 max 100\n"));
         assert!(out.contains("\noption name UCI_Chess960 type check default false\n"));
         assert!(out.contains("\noption name UCI_LimitStrength type check default false\n"));
         assert!(out.contains("\noption name UCI_Elo type spin default 1500 min 500 max 2000\n"));
@@ -898,6 +929,39 @@ mod tests {
     }
 
     #[test]
+    fn variety_applies_to_the_opening_of_a_game() {
+        let go = |args: &str| GoCommand::parse(args).unwrap();
+        let clock = go("wtime 60000 btime 60000");
+        let mut uci = Uci::new(Vec::new());
+        assert_eq!(uci.variety, 10);
+        assert!(uci.uses_variety(&clock));
+        assert!(uci.uses_variety(&go("depth 6")));
+        // Not for an analysis, nor later in the game, nor when turned off.
+        assert!(!uci.uses_variety(&go("infinite")));
+        uci.handle("position fen 4k3/8/8/8/8/8/8/4K2R w K - 0 11")
+            .unwrap();
+        assert!(!uci.uses_variety(&clock));
+        uci.handle("position startpos").unwrap();
+        uci.handle("setoption name Variety value 0").unwrap();
+        assert!(!uci.uses_variety(&clock));
+
+        // Every move it picks is legal; a mate is always within reach.
+        let (_, out) = session("position startpos\ngo depth 5");
+        let mv = out
+            .lines()
+            .last()
+            .unwrap()
+            .strip_prefix("bestmove ")
+            .unwrap();
+        assert!(
+            parse_move(&Position::startpos(), mv, false).is_some(),
+            "{out}"
+        );
+        let (_, out) = session("position fen 6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1\ngo depth 5");
+        assert!(out.ends_with("bestmove a1a8\n"), "{out}");
+    }
+
+    #[test]
     fn think_time_shortens_the_clock() {
         let ms = |millis: u64| Some(Duration::from_millis(millis));
         let limits = |args: &str, think: u64| {
@@ -905,7 +969,7 @@ mod tests {
                 .unwrap()
                 .limits(Color::White, 10, think)
         };
-        let times = |limits: Limits| (limits.soft_time, limits.hard_time, limits.trouble_time);
+        let times = |limits: Limits| (limits.soft_time, limits.hard_time, limits.max_time);
 
         // 10+5: the clock alone allows 11874 ms, or 71247 ms at most.
         let ten_five = "wtime 600000 btime 600000 winc 5000 binc 5000";
