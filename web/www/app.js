@@ -6,16 +6,20 @@
 // the list of moves played, in UCI notation, which is also what it saves.
 
 const THINK_MS = 3000;
+// The engine's move never appears sooner than this: the weaker levels
+// answer within milliseconds, which feels abrupt.
+const MIN_REPLY_MS = 600;
 const VARIETY_CP = 10;
 const STORAGE_KEY = "fishrod.game.v1";
 
 // The engine's strength setting (UCI_Elo) for each level; 0 is full
-// strength. The numbers are rough until they are measured.
+// strength. The settings are engine ratings, measured against Stockfish's
+// strength-limited mode; how strong they feel to people is still to be seen.
 const LEVELS = [
-  { id: "beginner", name: "Başlangıç", elo: 800, text: "Satrancı yeni öğrenenler için. Sık sık taş kaybeder." },
-  { id: "easy", name: "Kolay", elo: 1200, text: "Basit tehditleri görür ama çok hata yapar." },
-  { id: "medium", name: "Orta", elo: 1600, text: "Dikkatli oynar; zaman zaman hata yapar." },
-  { id: "hard", name: "Zor", elo: 1900, text: "Güçlü bir rakip; nadiren hata yapar." },
+  { id: "beginner", name: "Başlangıç", elo: 600, text: "Satrancı yeni öğrenenler için. Sık sık taş kaybeder." },
+  { id: "easy", name: "Kolay", elo: 1000, text: "Tek hamlelik tehditleri görür, ötesini pek göremez." },
+  { id: "medium", name: "Orta", elo: 1400, text: "Dikkatli oynar; zaman zaman hata yapar." },
+  { id: "hard", name: "Zor", elo: 1800, text: "Güçlü bir rakip; nadiren hata yapar." },
   { id: "max", name: "Tam güç", elo: 0, text: "Motorun bütün gücü." },
 ];
 
@@ -95,7 +99,14 @@ let epoch = 0;
 
 const $ = (id) => document.getElementById(id);
 const boardEl = $("board");
+const marksEl = $("marks");
 const squares = new Array(64);
+
+// Arrows and circles drawn on the board: { from, to, color }, a circle when
+// `from` equals `to`. Not saved; a move or a left click clears them.
+let marks = [];
+// The mark being drawn with the right button, if any.
+let marking = null;
 
 // Squares and moves
 
@@ -170,6 +181,7 @@ async function refresh() {
 // and lets the engine move when it is its turn.
 async function advance(animated) {
   game.selected = null;
+  marks = [];
   await refresh();
   render(animated);
   save();
@@ -185,11 +197,14 @@ async function engineMove() {
   game.thinking = true;
   render();
   const seed = Math.floor(Math.random() * 2 ** 52);
+  const started = performance.now();
   let answer;
   try {
     answer = await engine.ask(
       `play ${THINK_MS} ${VARIETY_CP} ${level().elo} ${seed} ${game.moves.join(" ")}`
     );
+    const wait = MIN_REPLY_MS - (performance.now() - started);
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
   } finally {
     if (token === epoch) game.thinking = false;
   }
@@ -394,6 +409,7 @@ function coordinate(className, text) {
 
 function render(animated) {
   renderBoard(animated);
+  renderMarks();
   renderPlayers();
   renderMoves();
   renderStatus();
@@ -438,6 +454,48 @@ function renderBoard(animated) {
   }
 
   if (animated) slide(squareIndex(animated.slice(0, 2)), squareIndex(animated.slice(2, 4)));
+}
+
+// The centre of a square in board units: the board is 8 by 8, top left 0, 0.
+function squareCenter(sq) {
+  const whiteBelow = game.orientation === "w";
+  const file = sq % 8;
+  const rank = Math.floor(sq / 8);
+  return [(whiteBelow ? file : 7 - file) + 0.5, (whiteBelow ? 7 - rank : rank) + 0.5];
+}
+
+function svgElement(tag, attributes) {
+  const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [name, value] of Object.entries(attributes)) el.setAttribute(name, value);
+  return el;
+}
+
+function markElement({ from, to, color }) {
+  const group = svgElement("g", { class: `mark ${color}` });
+  const [x1, y1] = squareCenter(from);
+  if (from === to) {
+    group.append(svgElement("circle", { cx: x1, cy: y1, r: 0.46, "stroke-width": 0.07 }));
+    return group;
+  }
+  // A shaft from the centre of one square and a head ending at the centre
+  // of the other.
+  const [x2, y2] = squareCenter(to);
+  const length = Math.hypot(x2 - x1, y2 - y1);
+  const [dx, dy] = [(x2 - x1) / length, (y2 - y1) / length];
+  const [headLength, headWidth] = [0.42, 0.24];
+  const [bx, by] = [x2 - dx * headLength, y2 - dy * headLength];
+  group.append(
+    svgElement("line", { x1, y1, x2: bx, y2: by, "stroke-width": 0.16 }),
+    svgElement("polygon", {
+      points: `${x2},${y2} ${bx - dy * headWidth},${by + dx * headWidth} ${bx + dy * headWidth},${by - dx * headWidth}`,
+    })
+  );
+  return group;
+}
+
+function renderMarks() {
+  const shown = marking && marking.to !== null ? [...marks, marking] : marks;
+  marksEl.replaceChildren(...shown.map(markElement));
 }
 
 // Slides the piece that has just arrived on `to` from `from`.
@@ -567,8 +625,51 @@ function tryMove(from, to, animated) {
   return true;
 }
 
+// Marks: the right button draws an arrow from the square where it is pressed
+// to the one where it is let go, or a circle when both are the same. Shift
+// draws in red, Alt or Ctrl in blue; drawing a mark again removes it.
+
+function markColor(event) {
+  if (event.shiftKey) return "red";
+  if (event.altKey || event.ctrlKey || event.metaKey) return "blue";
+  return "green";
+}
+
+function startMark(event) {
+  const sq = squareAt(event.clientX, event.clientY);
+  if (sq === null) return;
+  event.preventDefault();
+  marking = { from: sq, to: sq, color: markColor(event), id: event.pointerId };
+  try {
+    boardEl.setPointerCapture(event.pointerId);
+  } catch {
+    // As for dragging pieces: the mark ends on the next event.
+  }
+  renderMarks();
+}
+
+function endMark(keep) {
+  const { from, to, color } = marking;
+  marking = null;
+  if (keep && to !== null) {
+    const i = marks.findIndex((mark) => mark.from === from && mark.to === to);
+    if (i < 0) marks.push({ from, to, color });
+    else if (marks[i].color === color) marks.splice(i, 1);
+    else marks[i] = { from, to, color };
+  }
+  renderMarks();
+}
+
 function onPointerDown(event) {
+  if (event.button === 2) {
+    startMark(event);
+    return;
+  }
   if (!event.isPrimary || event.button > 0) return;
+  if (marks.length > 0) {
+    marks = [];
+    renderMarks();
+  }
   hidePromotion();
   const sq = squareAt(event.clientX, event.clientY);
   if (sq === null || !canMove()) return;
@@ -594,6 +695,14 @@ function onPointerDown(event) {
 }
 
 function onPointerMove(event) {
+  if (marking && event.pointerId === marking.id) {
+    const over = squareAt(event.clientX, event.clientY);
+    if (over !== marking.to) {
+      marking.to = over;
+      renderMarks();
+    }
+    return;
+  }
   if (!drag || event.pointerId !== drag.id) return;
   if (!drag.active) {
     if (Math.hypot(event.clientX - drag.x, event.clientY - drag.y) < 5) return;
@@ -735,8 +844,14 @@ function onResign() {
 function bind() {
   boardEl.addEventListener("pointerdown", onPointerDown);
   boardEl.addEventListener("pointermove", onPointerMove);
-  boardEl.addEventListener("pointerup", (event) => endDrag(event, true));
-  boardEl.addEventListener("pointercancel", (event) => endDrag(event, false));
+  boardEl.addEventListener("pointerup", (event) => {
+    if (marking && event.pointerId === marking.id) endMark(true);
+    else endDrag(event, true);
+  });
+  boardEl.addEventListener("pointercancel", (event) => {
+    if (marking && event.pointerId === marking.id) endMark(false);
+    else endDrag(event, false);
+  });
   boardEl.addEventListener("contextmenu", (event) => event.preventDefault());
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") hidePromotion();

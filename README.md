@@ -39,6 +39,8 @@ Fishrod communicates through the Universal Chess Interface (UCI) and is intended
 
 Two options make Fishrod more pleasant to play against. `Think Time` (in milliseconds) keeps a brisk pace under a clock: a move takes about that long, less when the choice is easy and up to twice as long when the position turns difficult. `Variety` (in centipawns) varies the first moves among nearly equal ones, so that games do not all open alike. Both are off by default, which gives the engine's full strength for engine matches and long games; 4000 and 10 suit games against people.
 
+With `UCI_LimitStrength`, Fishrod plays at the strength set by `UCI_Elo`, from 500 to 2300. The settings are engine ratings on the CCRL 40/4 scale, measured in matches against Stockfish's strength-limited mode: from 1020 up the engine searches fewer positions per move, and below that it also picks its moves at random among those not much worse than the best, so that it makes mistakes.
+
 ## Web version
 
 The `web` directory holds a version of Fishrod that runs entirely in the browser: the engine compiled to WebAssembly, with a board to play against it. It is published at <https://xelma123.github.io/Fishrod/>.

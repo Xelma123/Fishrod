@@ -114,7 +114,7 @@ pub fn mate_in(score: i32) -> Option<i32> {
 pub struct Limits {
     /// Iterations to complete.
     pub depth: Option<u32>,
-    /// Nodes to visit.
+    /// Nodes to visit, once the first iteration is complete.
     pub nodes: Option<u64>,
     /// No new iteration starts once this much time has passed.
     pub soft_time: Option<Duration>,
@@ -162,8 +162,9 @@ pub struct Outcome {
 /// last irreversible move, oldest first; repeating one of them is a draw.
 /// The search reads and fills `tt`; the same table should serve every search
 /// of a game, and be cleared for a new one. Setting `stop` ends the search
-/// early. Time limits and `stop` only take effect once the first iteration
-/// is complete, so a searched move is always available. `report` is called
+/// early. Time and node limits and `stop` only take effect once the first
+/// iteration is complete, so a searched move is always available, with
+/// every root move scored when `exact_root_scores` is set. `report` is called
 /// after every completed iteration.
 pub fn search(
     root: &Position,
@@ -304,8 +305,8 @@ struct Searcher<'a> {
     stop: &'a AtomicBool,
     start: Instant,
     hard_time: Option<Duration>,
-    /// Whether time and the stop flag may cut the search short: true once the
-    /// first iteration is complete.
+    /// Whether the limits and the stop flag may cut the search short: true
+    /// once the first iteration is complete.
     interruptible: bool,
     /// Set once a limit is reached; every node then returns at once.
     stopped: bool,
@@ -331,9 +332,12 @@ impl Searcher<'_> {
     /// Counts a node and tells whether the search must stop.
     fn visit(&mut self) -> bool {
         self.nodes += 1;
+        if !self.interruptible {
+            return false;
+        }
         if self.nodes >= self.node_limit {
             self.stopped = true;
-        } else if self.interruptible && self.nodes.is_multiple_of(CHECK_INTERVAL) {
+        } else if self.nodes.is_multiple_of(CHECK_INTERVAL) {
             let out_of_time = self
                 .hard_time
                 .is_some_and(|hard| self.start.elapsed() >= hard);
@@ -982,6 +986,27 @@ mod tests {
         let outcome = search_quietly(&Position::startpos(), &[], limits);
         assert!(outcome.best_move.is_some());
         assert!(outcome.nodes <= 5_000);
+
+        // Even a tiny limit lets the first iteration finish, every root move
+        // scored, rather than leave the first move generated.
+        let kiwipete = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .unwrap();
+        let limits = Limits {
+            nodes: Some(1),
+            exact_root_scores: true,
+            ..Limits::default()
+        };
+        let outcome = search_quietly(&kiwipete, &[], limits);
+        assert_eq!(outcome.depth, 1);
+        assert_eq!(outcome.root_scores.len(), legal_moves(&kiwipete).len());
+        let best = outcome
+            .root_scores
+            .iter()
+            .max_by_key(|&&(_, score)| score)
+            .unwrap();
+        assert_eq!(best.1, outcome.score);
     }
 
     #[test]

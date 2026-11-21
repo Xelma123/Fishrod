@@ -610,20 +610,27 @@ mod tests {
         assert!(out.contains("\noption name Variety type spin default 0 min 0 max 100\n"));
         assert!(out.contains("\noption name UCI_Chess960 type check default false\n"));
         assert!(out.contains("\noption name UCI_LimitStrength type check default false\n"));
-        assert!(out.contains("\noption name UCI_Elo type spin default 1500 min 500 max 2000\n"));
+        assert!(out.contains("\noption name UCI_Elo type spin default 1500 min 500 max 2300\n"));
         assert!(out.contains("\noption name GameLog type string default <empty>\n"));
         assert!(out.ends_with("uciok\nreadyok\n"));
     }
 
     #[test]
-    fn limited_strength_searches_shallow_but_takes_a_mate() {
+    fn limited_strength_searches_little_but_takes_a_mate() {
         let weakest = "setoption name UCI_LimitStrength value true\n\
                        setoption name UCI_Elo value 500\n";
         let (_, out) = session(&format!(
             "{weakest}position startpos\ngo wtime 10000 btime 10000"
         ));
-        assert!(out.contains("info depth 1 "), "{out}");
-        assert!(!out.contains("info depth 2 "), "{out}");
+        let nodes: Vec<u64> = out
+            .lines()
+            .filter_map(|line| line.split(" nodes ").nth(1))
+            .map(|rest| rest.split(' ').next().unwrap().parse().unwrap())
+            .collect();
+        assert!(
+            !nodes.is_empty() && nodes.iter().all(|&n| n <= 1_000),
+            "{out}"
+        );
         assert!(
             out.lines().last().unwrap().starts_with("bestmove "),
             "{out}"

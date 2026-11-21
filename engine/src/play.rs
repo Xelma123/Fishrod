@@ -6,8 +6,8 @@
 //! normally takes a few seconds, easy ones less and difficult ones up to
 //! twice as long (see `search::Limits::max_time`). Early in the game it
 //! draws its move from those nearly as good as the best (`Variety`), so that
-//! games do not all open alike; at reduced strength it draws from a wider
-//! choice and searches less deep.
+//! games do not all open alike. At reduced strength it searches fewer nodes,
+//! and at the weakest settings it draws from a wider choice.
 
 use std::time::Duration;
 
@@ -74,24 +74,25 @@ impl Style {
     /// Fits `limits` for a search of `pos` to the style. An `analysis` (`go
     /// infinite`) only wants the best move, so it is not drawn.
     ///
-    /// At reduced strength the search goes less deep and the move is drawn
-    /// within the strength's margin; otherwise, up to move `VARIETY_MOVES`,
-    /// within `variety`. Drawing needs every root move's exact score, and
-    /// the time is not stretched: the best move changes often among nearly
-    /// equal ones, which is no reason to think longer when one is drawn.
+    /// At reduced strength the search looks at fewer nodes, and at the
+    /// weakest settings the move is drawn within the strength's margin.
+    /// Otherwise, up to move `VARIETY_MOVES`, it is drawn within `variety`.
+    /// Drawing needs every root move's exact score, and the time is not
+    /// stretched: the best move changes often among nearly equal ones, which
+    /// is no reason to think longer when one is drawn.
     pub fn plan(&self, pos: &Position, mut limits: Limits, analysis: bool) -> Plan {
         let strength = self.elo.map(Strength::new);
         if let Some(strength) = strength {
-            let depth = limits
-                .depth
-                .map_or(strength.depth(), |d| d.min(strength.depth()));
-            limits.depth = Some(depth);
+            let nodes = limits
+                .nodes
+                .map_or(strength.nodes(), |n| n.min(strength.nodes()));
+            limits.nodes = Some(nodes);
         }
-        let margin = match strength {
-            Some(strength) => Some(strength.margin()),
-            None => (self.variety > 0 && !analysis && pos.fullmove_number() <= VARIETY_MOVES)
-                .then_some(self.variety as i32),
-        };
+        let weak_margin = strength.map(Strength::margin).filter(|&m| m > 0);
+        let margin = weak_margin.or_else(|| {
+            (self.variety > 0 && !analysis && pos.fullmove_number() <= VARIETY_MOVES)
+                .then_some(self.variety as i32)
+        });
         if margin.is_some() {
             limits.exact_root_scores = true;
             limits.max_time = None;
@@ -157,13 +158,23 @@ mod tests {
             clock.max_time
         );
 
-        // Reduced strength draws at any point and limits the depth.
+        // Reduced strength limits the nodes. The weakest settings draw at
+        // any point; stronger ones play their best move, with the opening
+        // varied as at full strength.
         let weak = Style {
             elo: Some(800),
             variety: 0,
         };
         let plan = weak.plan(&later, clock, false);
         assert!(plan.draws_move());
-        assert_eq!(plan.limits.depth, Some(2));
+        assert_eq!((plan.limits.nodes, plan.limits.depth), (Some(100), None));
+        let club = Style {
+            elo: Some(2000),
+            variety: 10,
+        };
+        let plan = club.plan(&later, clock, false);
+        assert!(!plan.draws_move());
+        assert_eq!(plan.limits.nodes, Some(100_000));
+        assert!(club.plan(&start, clock, false).draws_move());
     }
 }
