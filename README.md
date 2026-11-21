@@ -2,7 +2,7 @@
 
 Fishrod is a UCI chess engine written from scratch in Rust.
 
-**Status:** Early development. Phases 1 to 3 of 7 are complete: the engine plays full games over UCI, and every change that affects its strength is measured with an SPRT. Phase 4 (strong classical search) is next.
+**Status:** Version 0.1.0. Phases 1 to 4 of 7 are complete: a classical alpha-beta search with a hand-crafted evaluation, measured at about 2500 on the CCRL 40/4 scale in matches against Stockfish's strength-limited mode. Every change that affects its strength is measured with an SPRT. Phase 5 (an NNUE evaluation trained on Fishrod's own games) is next.
 
 ## Design
 
