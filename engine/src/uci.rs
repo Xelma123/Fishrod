@@ -31,12 +31,14 @@ const HASH_MAX: u64 = 65_536;
 /// for the delay between the engine and the GUI's clock.
 const MOVE_OVERHEAD_DEFAULT: u64 = 10;
 const MOVE_OVERHEAD_MAX: u64 = 5_000;
-/// Default and largest `Think Time`, in milliseconds; 0 turns it off. On by
-/// default, for brisk games against people.
-const THINK_TIME_DEFAULT: u64 = 4_000;
+/// Default and largest `Think Time`, in milliseconds; 0 turns it off. Off by
+/// default, so that engine matches and rating lists get the engine's full
+/// strength; about 4000 suits brisk games against people.
+const THINK_TIME_DEFAULT: u64 = 0;
 const THINK_TIME_MAX: u64 = 60_000;
-/// Default and largest `Variety`, in centipawns; 0 turns it off.
-const VARIETY_DEFAULT: u32 = 10;
+/// Default and largest `Variety`, in centipawns; 0 turns it off. Off by
+/// default for the same reason; about 10 suits games against people.
+const VARIETY_DEFAULT: u32 = 0;
 const VARIETY_MAX: u32 = 100;
 /// Moves assumed to remain until the next time control when the GUI does
 /// not say (`movestogo`).
@@ -604,8 +606,8 @@ mod tests {
         let (_, out) = session("uci\nisready");
         assert!(out.starts_with("id name Fishrod "));
         assert!(out.contains("\noption name Move Overhead type spin default 10 min 0 max 5000\n"));
-        assert!(out.contains("\noption name Think Time type spin default 4000 min 0 max 60000\n"));
-        assert!(out.contains("\noption name Variety type spin default 10 min 0 max 100\n"));
+        assert!(out.contains("\noption name Think Time type spin default 0 min 0 max 60000\n"));
+        assert!(out.contains("\noption name Variety type spin default 0 min 0 max 100\n"));
         assert!(out.contains("\noption name UCI_Chess960 type check default false\n"));
         assert!(out.contains("\noption name UCI_LimitStrength type check default false\n"));
         assert!(out.contains("\noption name UCI_Elo type spin default 1500 min 500 max 2000\n"));
@@ -883,12 +885,12 @@ mod tests {
     #[test]
     fn variety_applies_to_the_opening_of_a_game() {
         // When it applies is tested in `play`; here the option and the moves.
-        assert_eq!(Uci::new(Vec::new()).variety, 10);
-        let (uci, out) = session("setoption name Variety value 0");
-        assert_eq!((uci.variety, out.as_str()), (0, ""));
+        assert_eq!(Uci::new(Vec::new()).variety, 0);
+        let (uci, out) = session("setoption name Variety value 10");
+        assert_eq!((uci.variety, out.as_str()), (10, ""));
 
         // Every move it picks is legal; a mate is always within reach.
-        let (_, out) = session("position startpos\ngo depth 5");
+        let (_, out) = session("setoption name Variety value 10\nposition startpos\ngo depth 5");
         let mv = out
             .lines()
             .last()
@@ -899,7 +901,9 @@ mod tests {
             parse_move(&Position::startpos(), mv, false).is_some(),
             "{out}"
         );
-        let (_, out) = session("position fen 6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1\ngo depth 5");
+        let (_, out) = session(
+            "setoption name Variety value 10\nposition fen 6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1\ngo depth 5",
+        );
         assert!(out.ends_with("bestmove a1a8\n"), "{out}");
     }
 
@@ -933,8 +937,8 @@ mod tests {
         assert_eq!(times(limits("depth 12", 4000)), (None, None, None));
         assert_eq!(times(limits("infinite", 4000)), (None, None, None));
 
-        // The option itself, on by default.
-        assert_eq!(Uci::new(Vec::new()).think_time, 4000);
+        // The option itself, off by default.
+        assert_eq!(Uci::new(Vec::new()).think_time, 0);
         let (uci, out) = session("setoption name Think Time value 3500");
         assert_eq!((uci.think_time, out.as_str()), (3500, ""));
         let (_, out) = session("setoption name Think Time value 70000");

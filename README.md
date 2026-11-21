@@ -12,6 +12,10 @@ Fishrod is a UCI chess engine written from scratch in Rust.
 
 The board, move generation, search, evaluation and network inference are original work; no code is taken from other engines. Ideas adopted from published work are credited in the commit history.
 
+## Download
+
+Prebuilt binaries for Windows and Linux are on the [releases page](https://github.com/Xelma123/Fishrod/releases). They run on any 64-bit x86 processor.
+
 ## Building
 
 Fishrod requires a stable Rust toolchain that supports the 2024 edition.
@@ -33,7 +37,7 @@ Fishrod communicates through the Universal Chess Interface (UCI) and is intended
 | `fishrod bench [depth]` | Searches a fixed set of positions to a fixed depth and prints the total node count and speed. |
 | `fishrod openings <count> [seed]` | Prints balanced opening positions in EPD format, for engine-versus-engine tests. |
 
-Against people, Fishrod keeps a brisk pace by default: under a clock a move takes about four seconds, less when the choice is easy and up to twice as long when the position turns difficult (`Think Time`, in milliseconds). It also varies its first moves among nearly equal ones, so that games do not all open alike (`Variety`, in centipawns). Set both options to 0 for engine-versus-engine matches and long games.
+Two options make Fishrod more pleasant to play against. `Think Time` (in milliseconds) keeps a brisk pace under a clock: a move takes about that long, less when the choice is easy and up to twice as long when the position turns difficult. `Variety` (in centipawns) varies the first moves among nearly equal ones, so that games do not all open alike. Both are off by default, which gives the engine's full strength for engine matches and long games; 4000 and 10 suit games against people.
 
 ## Web version
 
